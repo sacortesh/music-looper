@@ -1,0 +1,109 @@
+#!/bin/bash
+# Usage: ./ralph.sh build [max_iterations]
+#        ./ralph.sh plan  [max_iterations] "feature description"
+# Examples:
+#   ./ralph.sh build              # Implement tasks one at a time (unlimited)
+#   ./ralph.sh build 5            # Implement up to 5 tasks
+#   ./ralph.sh plan 1 "add navigation step tracking when URL changes"
+#   ./ralph.sh plan 0 "refactor selector engine to support iframes"
+#
+# Files:
+#   PROMPT_build.md  — PRD with phases & tasks (the plan Claude reads)
+#   progress.md      — Tracks completed work (Claude updates this after each task)
+
+set -e
+
+# jq filter: stream assistant text tokens as they arrive
+STREAM_TEXT='select(.type == "assistant").message.content[]? | select(.type == "text").text // empty'
+# jq filter: extract final result text
+FINAL_RESULT='select(.type == "result").result // empty'
+
+# --- Parse arguments ---
+MODE="${1:-build}"
+if [[ "$MODE" != "plan" && "$MODE" != "build" ]]; then
+    echo "Usage: ./ralph.sh build [max_iterations]"
+    echo "       ./ralph.sh plan  [max_iterations] \"feature description\""
+    exit 1
+fi
+MAX_ITERATIONS=${2:-0}
+FEATURE_DESC="${3:-}"
+
+ITERATION=0
+CURRENT_BRANCH=$(git branch --show-current)
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Mode:   $MODE"
+echo "Branch: $CURRENT_BRANCH"
+[ "$MAX_ITERATIONS" -gt 0 ] 2>/dev/null && echo "Max:    $MAX_ITERATIONS iterations"
+[ -n "$FEATURE_DESC" ] && echo "Feature: $FEATURE_DESC"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# --- Build the prompt based on mode ---
+if [ "$MODE" = "build" ]; then
+    PROMPT="@PROMPT_build.md @progress.md
+1. Read the PRD (PROMPT_build.md) and the progress file (progress.md).
+2. Find the next incomplete task — the first one not yet marked done in progress.md.
+3. Implement that single task. Write code, add tests if absolutely necessary (do not add non value tests).
+4. Commit your changes with a clear message describing what you did.
+5. Update progress.md to reflect the completed task and current test counts.
+ONLY DO ONE TASK PER ITERATION. Stop after committing and updating progress."
+
+elif [ "$MODE" = "plan" ]; then
+    FEATURE_LINE=""
+    if [ -n "$FEATURE_DESC" ]; then
+        FEATURE_LINE="
+NEW FEATURE REQUEST: \"$FEATURE_DESC\"
+Plan the tasks needed to implement this feature."
+    fi
+
+    PROMPT="@PROMPT_build.md @progress.md
+1. Read the PRD (PROMPT_build.md) and the progress file (progress.md).
+2. Review what has been built so far vs. what remains in the plan.${FEATURE_LINE}
+3. Add new phases/tasks to PROMPT_build.md for the requested work.
+4. Ensure tasks are small, concrete, and ordered by dependency.
+5. Commit the updated plan.
+6. Update progress.md if any structural changes were made.
+ONLY PLAN — do not implement any code. Stop after committing the updated plan."
+fi
+
+# --- Loop ---
+while true; do
+    if [ "$MAX_ITERATIONS" -gt 0 ] 2>/dev/null && [ "$ITERATION" -ge "$MAX_ITERATIONS" ]; then
+        echo "Reached max iterations: $MAX_ITERATIONS"
+        break
+    fi
+
+    TMPFILE=$(mktemp)
+    trap "rm -f $TMPFILE" EXIT
+
+    # --allowedTools: auto-approve file edits + git commands (Bash is blocked by default)
+    # --output-format stream-json:   structured output; piped through jq for readable streaming
+    # --model opus:                  best reasoning for task selection & implementation
+    #                                swap to 'sonnet' for speed when tasks are well-defined
+    claude -p "$PROMPT" \
+        --allowedTools 'Edit,Write,Read,Glob,Grep,Bash(git commit:*),Bash(git add:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(node:*)' \
+        --output-format=stream-json \
+        --model opus \
+        --verbose \
+    | grep --line-buffered '^{' \
+    | tee "$TMPFILE" \
+    | jq --unbuffered -rj "$STREAM_TEXT"
+
+    echo ""
+
+    RESULT=$(jq -r "$FINAL_RESULT" "$TMPFILE" | tail -1)
+
+    # Push changes after each iteration
+    git push origin "$CURRENT_BRANCH" || {
+        echo "Failed to push. Creating remote branch..."
+        git push -u origin "$CURRENT_BRANCH"
+    }
+
+    ITERATION=$((ITERATION + 1))
+    echo -e "\n======================== LOOP $ITERATION DONE ========================\n"
+
+    # Stop early if Claude signals completion (plan mode with max=1, etc.)
+    if [ "$MAX_ITERATIONS" -eq 1 ] 2>/dev/null; then
+        break
+    fi
+done
