@@ -16,3 +16,5 @@ _No feedback recorded yet._
 - Go is installed at `/usr/local/go/bin/go` (v1.26.2) but not on default PATH — needs explicit PATH export.
 - There is an mp3 called `sample1.mp3`
 - Autocorrelation loop detection uses brute-force O(n²) — works at 11025 Hz downsampled rate but will need FFT optimization (Task 7) for longer tracks.
+- Crossfade at loop junctions works by trimming cfLen frames from the output tail, then blending them with the head of the next loop iteration using linear interpolation. This avoids infinite-loop bugs where in-place blending doesn't grow the output.
+- `TestEncodeMP3_RoundTrip` times out (30s) when re-decoding lame-encoded output — pre-existing issue, possibly go-mp3 struggling with lame's output format.
