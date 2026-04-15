@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hajimehoshi/go-mp3"
+	"github.com/viert/go-lame"
 )
 
 func main() {
@@ -35,6 +36,13 @@ func main() {
 	fmt.Printf("Duration:     %s\n", stats.Duration.Round(time.Millisecond))
 	fmt.Printf("Samples:      %d\n", stats.SampleCount)
 	fmt.Printf("Target:       %.1f minutes\n", targetMinutes)
+
+	outputPath := inputPath[:len(inputPath)-len(".mp3")] + "_loop.mp3"
+	if err := encodeMP3(outputPath, stats); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Output:       %s\n", outputPath)
 }
 
 // AudioStats holds metadata about a decoded MP3.
@@ -77,4 +85,28 @@ func decodeMP3(path string) (*AudioStats, error) {
 		SampleCount: sampleCount,
 		PCM:         pcm,
 	}, nil
+}
+
+// encodeMP3 writes PCM data from AudioStats to an MP3 file.
+func encodeMP3(path string, stats *AudioStats) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	defer f.Close()
+
+	enc := lame.NewEncoder(f)
+	defer enc.Close()
+
+	enc.SetInSamplerate(stats.SampleRate)
+	enc.SetNumChannels(stats.Channels)
+	if err := enc.SetQuality(2); err != nil {
+		return fmt.Errorf("set quality: %w", err)
+	}
+
+	if _, err := enc.Write(stats.PCM); err != nil {
+		return fmt.Errorf("encode pcm: %w", err)
+	}
+
+	return nil
 }
