@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -37,12 +39,56 @@ func main() {
 	fmt.Printf("Samples:      %d\n", stats.SampleCount)
 	fmt.Printf("Target:       %.1f minutes\n", targetMinutes)
 
+	mono := pcmToMono(stats.PCM, stats.SampleRate, 11025)
+	monoDur := time.Duration(float64(len(mono.Samples)) / float64(mono.SampleRate) * float64(time.Second))
+	fmt.Printf("Mono signal:  %d samples @ %d Hz (%s)\n", len(mono.Samples), mono.SampleRate, monoDur.Round(time.Millisecond))
+
 	outputPath := inputPath[:len(inputPath)-len(".mp3")] + "_loop.mp3"
 	if err := encodeMP3(outputPath, stats); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Output:       %s\n", outputPath)
+}
+
+// MonoSignal holds a downsampled mono signal ready for analysis.
+type MonoSignal struct {
+	Samples    []float64
+	SampleRate int
+}
+
+// pcmToMono converts stereo 16-bit PCM to a mono float64 signal,
+// normalized to [-1.0, 1.0], and downsampled to targetRate Hz.
+func pcmToMono(pcm []byte, srcRate, targetRate int) *MonoSignal {
+	// Each stereo sample frame = 4 bytes (2 bytes L + 2 bytes R)
+	frameCount := len(pcm) / 4
+
+	// Step 1: Convert to mono float64 normalized to [-1.0, 1.0]
+	mono := make([]float64, frameCount)
+	for i := 0; i < frameCount; i++ {
+		off := i * 4
+		left := int16(binary.LittleEndian.Uint16(pcm[off : off+2]))
+		right := int16(binary.LittleEndian.Uint16(pcm[off+2 : off+4]))
+		mono[i] = (float64(left) + float64(right)) / (2.0 * 32768.0)
+	}
+
+	// Step 2: Downsample via simple decimation with averaging
+	ratio := float64(srcRate) / float64(targetRate)
+	outLen := int(math.Floor(float64(frameCount) / ratio))
+	downsampled := make([]float64, outLen)
+	for i := 0; i < outLen; i++ {
+		center := float64(i) * ratio
+		idx := int(center)
+		if idx >= frameCount {
+			idx = frameCount - 1
+		}
+		downsampled[i] = mono[idx]
+	}
+
+	return &MonoSignal{
+		Samples:    downsampled,
+		SampleRate: targetRate,
+	}
 }
 
 // AudioStats holds metadata about a decoded MP3.
