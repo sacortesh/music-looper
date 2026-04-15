@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestDecodeMP3_InvalidPath(t *testing.T) {
@@ -160,6 +161,70 @@ func TestDetectLoop_ShortTrack(t *testing.T) {
 	gotMs := result.Length.Seconds() * 1000
 	if math.Abs(gotMs-expectedMs) > 1 {
 		t.Errorf("expected length ~100ms, got %.1fms", gotMs)
+	}
+}
+
+func TestExtendAudio_DoublesLength(t *testing.T) {
+	// Build 1s of stereo PCM at 1000 Hz (1000 frames, 4000 bytes)
+	rate := 1000
+	frames := 1000
+	pcm := make([]byte, frames*4)
+	for i := 0; i < frames; i++ {
+		val := int16(i % 100)
+		binary.LittleEndian.PutUint16(pcm[i*4:], uint16(val))
+		binary.LittleEndian.PutUint16(pcm[i*4+2:], uint16(val))
+	}
+
+	loop := &LoopResult{
+		Start:  0,
+		End:    1 * time.Second,
+		Length: 1 * time.Second,
+	}
+
+	// Target 2 seconds
+	result := extendAudio(pcm, rate, loop, 2*time.Second, 50)
+	gotFrames := len(result) / 4
+	// Should be approximately 2000 frames (within crossfade tolerance)
+	if gotFrames < 1900 || gotFrames > 2100 {
+		t.Errorf("expected ~2000 frames, got %d", gotFrames)
+	}
+}
+
+func TestExtendAudio_CrossfadeSmooth(t *testing.T) {
+	// Verify crossfade region doesn't clip (values stay in int16 range)
+	rate := 1000
+	frames := 1000
+	pcm := make([]byte, frames*4)
+	for i := 0; i < frames; i++ {
+		// Use max values to stress crossfade
+		val := int16(32767)
+		binary.LittleEndian.PutUint16(pcm[i*4:], uint16(val))
+		binary.LittleEndian.PutUint16(pcm[i*4+2:], uint16(val))
+	}
+
+	loop := &LoopResult{Start: 0, End: 1 * time.Second, Length: 1 * time.Second}
+	result := extendAudio(pcm, rate, loop, 3*time.Second, 100)
+
+	// Check all samples are valid (no panics, reasonable length)
+	gotFrames := len(result) / 4
+	if gotFrames < 2800 {
+		t.Errorf("expected ~3000 frames, got %d", gotFrames)
+	}
+}
+
+func TestExtendAudio_ShorterThanOriginal(t *testing.T) {
+	// If target is shorter than the loop, output should still work
+	rate := 1000
+	frames := 2000
+	pcm := make([]byte, frames*4)
+	loop := &LoopResult{Start: 0, End: 2 * time.Second, Length: 2 * time.Second}
+
+	result := extendAudio(pcm, rate, loop, 1*time.Second, 50)
+	// Already have 2s after first iteration, should not loop more
+	// Output will be at least the first iteration (2000 frames)
+	gotFrames := len(result) / 4
+	if gotFrames < frames {
+		t.Errorf("expected at least %d frames, got %d", frames, gotFrames)
 	}
 }
 

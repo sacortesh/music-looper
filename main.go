@@ -49,8 +49,20 @@ func main() {
 	fmt.Printf("Loop length:  %s\n", loop.Length.Round(time.Millisecond))
 	fmt.Printf("Correlation:  %.4f\n", loop.Correlation)
 
+	targetDur := time.Duration(targetMinutes * float64(time.Minute))
+	extendedPCM := extendAudio(stats.PCM, stats.SampleRate, loop, targetDur, 50)
+	extendedDur := time.Duration(float64(len(extendedPCM)/4) / float64(stats.SampleRate) * float64(time.Second))
+	fmt.Printf("Extended:     %s\n", extendedDur.Round(time.Millisecond))
+
 	outputPath := inputPath[:len(inputPath)-len(".mp3")] + "_loop.mp3"
-	if err := encodeMP3(outputPath, stats); err != nil {
+	outStats := &AudioStats{
+		SampleRate:  stats.SampleRate,
+		Channels:    stats.Channels,
+		Duration:    extendedDur,
+		SampleCount: int64(len(extendedPCM) / 4),
+		PCM:         extendedPCM,
+	}
+	if err := encodeMP3(outputPath, outStats); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -205,6 +217,87 @@ func decodeMP3(path string) (*AudioStats, error) {
 		SampleCount: sampleCount,
 		PCM:         pcm,
 	}, nil
+}
+
+// extendAudio repeats the detected loop to fill targetDur, applying a
+// crossfade of crossfadeMs milliseconds at each loop junction.
+func extendAudio(pcm []byte, sampleRate int, loop *LoopResult, targetDur time.Duration, crossfadeMs int) []byte {
+	bytesPerFrame := 4 // stereo 16-bit
+	totalFrames := len(pcm) / bytesPerFrame
+	targetFrames := int(targetDur.Seconds() * float64(sampleRate))
+
+	loopStartFrame := int(loop.Start.Seconds() * float64(sampleRate))
+	loopEndFrame := int(loop.End.Seconds() * float64(sampleRate))
+	if loopEndFrame > totalFrames {
+		loopEndFrame = totalFrames
+	}
+	loopLen := loopEndFrame - loopStartFrame
+	if loopLen <= 0 {
+		// No valid loop — return original
+		return pcm
+	}
+
+	crossfadeFrames := crossfadeMs * sampleRate / 1000
+	if crossfadeFrames > loopLen/2 {
+		crossfadeFrames = loopLen / 2
+	}
+
+	// Start with intro (everything before loop start)
+	introBytes := loopStartFrame * bytesPerFrame
+	out := make([]byte, 0, targetFrames*bytesPerFrame)
+	out = append(out, pcm[:introBytes]...)
+
+	// Append the first loop iteration fully
+	loopBody := pcm[loopStartFrame*bytesPerFrame : loopEndFrame*bytesPerFrame]
+	out = append(out, loopBody...)
+
+	for len(out)/bytesPerFrame < targetFrames {
+		// Trim the crossfade region from the tail — it will be re-created
+		// as a blend of old tail + new head.
+		cfLen := crossfadeFrames
+		tailFrames := len(out) / bytesPerFrame
+		if cfLen > tailFrames {
+			cfLen = tailFrames
+		}
+		out = out[:len(out)-cfLen*bytesPerFrame]
+
+		// Build the next iteration (may be truncated to hit target)
+		needed := targetFrames - len(out)/bytesPerFrame
+		iterLen := loopLen
+		if iterLen > needed {
+			iterLen = needed
+		}
+		if cfLen > iterLen {
+			cfLen = iterLen
+		}
+
+		// Create crossfade blend for the first cfLen frames
+		nextIter := make([]byte, iterLen*bytesPerFrame)
+		copy(nextIter, loopBody[:iterLen*bytesPerFrame])
+
+		// Read the removed tail for blending
+		tailStart := len(out)
+		// The removed tail bytes are still accessible (capacity preserved)
+		removedTail := out[tailStart : tailStart+cfLen*bytesPerFrame]
+
+		for i := 0; i < cfLen; i++ {
+			alpha := float64(i) / float64(cfLen) // 0→1
+			tOff := i * bytesPerFrame
+			nOff := i * bytesPerFrame
+			for ch := 0; ch < 2; ch++ {
+				ti := tOff + ch*2
+				ni := nOff + ch*2
+				oldVal := int16(binary.LittleEndian.Uint16(removedTail[ti : ti+2]))
+				newVal := int16(binary.LittleEndian.Uint16(nextIter[ni : ni+2]))
+				blended := int16(float64(oldVal)*(1-alpha) + float64(newVal)*alpha)
+				binary.LittleEndian.PutUint16(nextIter[ni:ni+2], uint16(blended))
+			}
+		}
+
+		out = append(out, nextIter...)
+	}
+
+	return out
 }
 
 // encodeMP3 writes PCM data from AudioStats to an MP3 file.
