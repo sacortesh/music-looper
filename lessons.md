@@ -7,6 +7,7 @@
 ## Decisions
 - `go-mp3` always decodes to stereo 16-bit PCM (4 bytes per sample frame). Channels=2 is hardcoded based on library behavior.
 - `go-lame` encoder quality set to 2 (near-best quality, reasonable speed). CGO requires `libmp3lame` — installed via `brew install lame` at `/usr/local/Cellar/lame/3.100`.
+- Mono downsampling uses nearest-sample decimation (not interpolation) — simple and sufficient for autocorrelation analysis at 11025 Hz.
 
 ## Feedback
 _No feedback recorded yet._
