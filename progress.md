@@ -7,9 +7,11 @@
 - [x] **Task 4**: Loop detection via autocorrelation. `detectLoop()` computes normalized autocorrelation, finds best peak between min loop and half-track, reports start/end/length/correlation.
 - [x] **Task 5**: Audio extension by loop repetition. `extendAudio()` repeats detected loop body with 50ms crossfade at junctions, encodes extended PCM to output MP3.
 - [x] **Task 6**: Edge cases, validation, and CLI polish. Flag-based CLI (`--output`, `--min-loop`, `--max-loop`, `--crossfade`, `--dry-run`), input validation, low-correlation fallback to full-track loop.
+- [x] **Task 7**: Performance optimization. FFT-based autocorrelation via `go-dsp/fft`, progress indicator during loop detection and audio extension (shown with `--verbose`), `--verbose` flag for detailed output, integration test.
 
 ## Test Counts
 | Type | Count |
 |------|-------|
-| Unit |  18   |
-| BDD  |  16   |
+| Unit |  20   |
+| Integration | 1 (requires sample1.mp3, skipped in -short mode) |
+| BDD  |  18   |

@@ -20,3 +20,6 @@ _No feedback recorded yet._
 - `TestEncodeMP3_RoundTrip` times out (30s) when re-decoding lame-encoded output — pre-existing issue, possibly go-mp3 struggling with lame's output format. Updated timeout to 60s to accommodate.
 - CLI refactored from positional args to `flag.NewFlagSet` for extensibility. The `run()` function returns an exit code for testability, with `main()` as a thin wrapper.
 - Loop detection fallback: when autocorrelation peak is below 0.5, the tool falls back to looping the entire track rather than using a low-quality loop point.
+- FFT-based autocorrelation uses `github.com/madelynnblue/go-dsp/fft` (fork of `mjibson/go-dsp`). Signal is zero-padded to next power of 2 (≥2n) to avoid circular correlation artifacts. Normalization uses prefix sums of squares for O(1) per-lag energy computation.
+- `TestIntegration_FullPipeline` and `TestEncodeMP3_RoundTrip` are slow (~40-120s) because lame encoding of an ~8 min sample is expensive. Integration test is gated behind `testing.Short()` to keep `go test -short` fast.
+- Progress reporting uses a package-level `progressReporter` callback. This global state approach is simple but means tests must defer-reset it to nil after use.
