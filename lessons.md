@@ -15,3 +15,4 @@ _No feedback recorded yet._
 ## Learnings
 - Go is installed at `/usr/local/go/bin/go` (v1.26.2) but not on default PATH — needs explicit PATH export.
 - There is an mp3 called `sample1.mp3`
+- Autocorrelation loop detection uses brute-force O(n²) — works at 11025 Hz downsampled rate but will need FFT optimization (Task 7) for longer tracks.
