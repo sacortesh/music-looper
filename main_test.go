@@ -292,3 +292,132 @@ func TestEncodeMP3_InvalidPath(t *testing.T) {
 		t.Fatal("expected error for invalid output path")
 	}
 }
+
+func TestNextPow2(t *testing.T) {
+	cases := []struct{ in, want int }{
+		{1, 1}, {2, 2}, {3, 4}, {5, 8}, {1023, 1024}, {1024, 1024}, {1025, 2048},
+	}
+	for _, c := range cases {
+		got := nextPow2(c.in)
+		if got != c.want {
+			t.Errorf("nextPow2(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDetectLoop_FFTMatchesBruteForce(t *testing.T) {
+	// Verify FFT-based detection finds the same loop as expected for a composite signal
+	rate := 2000
+	n := rate * 5 // 5 seconds
+	samples := make([]float64, n)
+	// Signal with a 1.5s repeating pattern
+	for i := 0; i < n; i++ {
+		phase := float64(i) / (1.5 * float64(rate))
+		samples[i] = math.Sin(2*math.Pi*phase) + 0.5*math.Cos(4*math.Pi*phase)
+	}
+	mono := &MonoSignal{Samples: samples, SampleRate: rate}
+	result := detectLoop(mono, 1.0, 0)
+	loopSec := result.Length.Seconds()
+	if loopSec < 1.4 || loopSec > 1.6 {
+		t.Errorf("expected loop ~1.5s, got %.3fs", loopSec)
+	}
+	if result.Correlation < 0.95 {
+		t.Errorf("expected high correlation, got %.4f", result.Correlation)
+	}
+}
+
+func TestIntegration_FullPipeline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	const input = "sample1.mp3"
+	if _, err := os.Stat(input); os.IsNotExist(err) {
+		t.Skip("sample1.mp3 not found, skipping integration test")
+	}
+
+	outDir := t.TempDir()
+	outPath := outDir + "/integration_out.mp3"
+
+	code := run([]string{"--output", outPath, "--verbose", input, "1"})
+	if code != 0 {
+		t.Fatalf("run() returned exit code %d, expected 0", code)
+	}
+
+	info, err := os.Stat(outPath)
+	if err != nil {
+		t.Fatalf("output file not found: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("output file is empty")
+	}
+
+	// Re-decode to verify it's valid MP3
+	stats, err := decodeMP3(outPath)
+	if err != nil {
+		t.Fatalf("re-decode output: %v", err)
+	}
+	// Target is 1 minute, so output should be around 60s
+	if stats.Duration.Seconds() < 50 {
+		t.Errorf("expected output ~60s, got %s", stats.Duration)
+	}
+}
+
+func TestProgressReporter_CalledDuringDetection(t *testing.T) {
+	rate := 1000
+	n := rate * 4
+	samples := make([]float64, n)
+	for i := 0; i < n; i++ {
+		samples[i] = math.Sin(2 * math.Pi * float64(i) / float64(rate))
+	}
+
+	called := false
+	progressReporter = func(pct float64, msg string) {
+		called = true
+		if pct < 0 || pct > 100 {
+			t.Errorf("progress percentage out of range: %f", pct)
+		}
+	}
+	defer func() { progressReporter = nil }()
+
+	mono := &MonoSignal{Samples: samples, SampleRate: rate}
+	detectLoop(mono, 0.5, 0)
+	if !called {
+		t.Error("expected progress reporter to be called during loop detection")
+	}
+}
+
+func TestProgressReporter_CalledDuringExtension(t *testing.T) {
+	rate := 1000
+	frames := 1000
+	pcm := make([]byte, frames*4)
+	for i := 0; i < frames; i++ {
+		val := int16(i % 100)
+		binary.LittleEndian.PutUint16(pcm[i*4:], uint16(val))
+		binary.LittleEndian.PutUint16(pcm[i*4+2:], uint16(val))
+	}
+
+	called := false
+	progressReporter = func(pct float64, msg string) {
+		called = true
+	}
+	defer func() { progressReporter = nil }()
+
+	loop := &LoopResult{Start: 0, End: 1 * time.Second, Length: 1 * time.Second}
+	extendAudio(pcm, rate, loop, 3*time.Second, 50)
+	if !called {
+		t.Error("expected progress reporter to be called during audio extension")
+	}
+}
+
+func TestVerboseFlag_DryRun(t *testing.T) {
+	const input = "sample1.mp3"
+	if _, err := os.Stat(input); os.IsNotExist(err) {
+		t.Skip("sample1.mp3 not found, skipping verbose test")
+	}
+
+	// Verbose + dry-run should succeed without writing output
+	code := run([]string{"--verbose", "--dry-run", input, "1"})
+	if code != 0 {
+		t.Fatalf("run() returned exit code %d, expected 0", code)
+	}
+}

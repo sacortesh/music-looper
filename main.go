@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hajimehoshi/go-mp3"
+	"github.com/madelynnblue/go-dsp/fft"
 	"github.com/viert/go-lame"
 )
 
@@ -27,6 +28,7 @@ func run(args []string) int {
 	maxLoop := fs.Float64("max-loop", 0, "maximum loop duration in seconds (default: half track)")
 	crossfade := fs.Int("crossfade", 50, "crossfade duration in milliseconds")
 	dryRun := fs.Bool("dry-run", false, "analyze only, do not write output file")
+	verbose := fs.Bool("verbose", false, "print detailed progress information")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: music-loop [flags] <input.mp3> <target-minutes>\n\nFlags:\n")
@@ -67,6 +69,9 @@ func run(args []string) int {
 		return 1
 	}
 
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Decoding %s...\n", inputPath)
+	}
 	stats, err := decodeMP3(inputPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -80,6 +85,9 @@ func run(args []string) int {
 	fmt.Printf("Samples:      %d\n", stats.SampleCount)
 	fmt.Printf("Target:       %.1f minutes\n", targetMinutes)
 
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Converting to mono and downsampling to 11025 Hz...\n")
+	}
 	mono := pcmToMono(stats.PCM, stats.SampleRate, 11025)
 	monoDur := time.Duration(float64(len(mono.Samples)) / float64(mono.SampleRate) * float64(time.Second))
 	fmt.Printf("Mono signal:  %d samples @ %d Hz (%s)\n", len(mono.Samples), mono.SampleRate, monoDur.Round(time.Millisecond))
@@ -89,7 +97,24 @@ func run(args []string) int {
 		maxLoopSec = 0 // detectLoop will default to half-track
 	}
 
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Detecting loop (FFT-based autocorrelation, %d samples)...\n", len(mono.Samples))
+		lastPct := -1
+		progressReporter = func(pct float64, msg string) {
+			iPct := int(pct)
+			if iPct != lastPct && iPct%10 == 0 {
+				fmt.Fprintf(os.Stderr, "\r[progress] %s... %d%%", msg, iPct)
+				lastPct = iPct
+			}
+		}
+	} else {
+		progressReporter = nil
+	}
+	t0 := time.Now()
 	loop := detectLoop(mono, *minLoop, maxLoopSec)
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "\r[verbose] Loop detection completed in %s\n", time.Since(t0).Round(time.Millisecond))
+	}
 
 	if loop.Correlation < 0.5 {
 		fmt.Printf("Warning:      low correlation (%.4f), falling back to full-track loop\n", loop.Correlation)
@@ -108,7 +133,13 @@ func run(args []string) int {
 	}
 
 	targetDur := time.Duration(targetMinutes * float64(time.Minute))
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Extending audio to %s with %dms crossfade...\n", targetDur.Round(time.Millisecond), *crossfade)
+	}
 	extendedPCM := extendAudio(stats.PCM, stats.SampleRate, loop, targetDur, *crossfade)
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "\r[progress] Extending audio... 100%%\n")
+	}
 	extendedDur := time.Duration(float64(len(extendedPCM)/4) / float64(stats.SampleRate) * float64(time.Second))
 	fmt.Printf("Extended:     %s\n", extendedDur.Round(time.Millisecond))
 
@@ -123,11 +154,17 @@ func run(args []string) int {
 		SampleCount: int64(len(extendedPCM) / 4),
 		PCM:         extendedPCM,
 	}
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Encoding MP3 to %s...\n", outputPath)
+	}
 	if err := encodeMP3(outputPath, outStats); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
 	}
 	fmt.Printf("Output:       %s\n", outputPath)
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Done.\n")
+	}
 	return 0
 }
 
@@ -175,9 +212,18 @@ type LoopResult struct {
 	Correlation float64
 }
 
+// nextPow2 returns the smallest power of 2 >= n.
+func nextPow2(n int) int {
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
+}
+
 // detectLoop finds the longest repeating loop in the mono signal using
-// normalized autocorrelation. minLoopSec sets the minimum loop duration
-// in seconds; maxLoopSec sets the maximum (0 = half track length).
+// FFT-based normalized autocorrelation. minLoopSec sets the minimum loop
+// duration in seconds; maxLoopSec sets the maximum (0 = half track length).
 func detectLoop(mono *MonoSignal, minLoopSec, maxLoopSec float64) *LoopResult {
 	n := len(mono.Samples)
 	minLag := int(minLoopSec * float64(mono.SampleRate))
@@ -190,33 +236,61 @@ func detectLoop(mono *MonoSignal, minLoopSec, maxLoopSec float64) *LoopResult {
 	}
 
 	if minLag >= maxLag {
-		// Track too short for loop detection — treat whole track as loop
 		dur := time.Duration(float64(n) / float64(mono.SampleRate) * float64(time.Second))
 		return &LoopResult{Start: 0, End: dur, Length: dur, Correlation: 0}
 	}
 
-	// Precompute the energy of the full overlap region for normalization.
-	// For lag τ, we compare samples [0..n-τ) with [τ..n).
-	// Normalized autocorrelation: r(τ) = Σ x(t)*x(t+τ) / sqrt(Σ x(t)² * Σ x(t+τ)²)
+	// FFT-based autocorrelation: R(τ) = IFFT(|FFT(x)|²)
+	// Pad to next power of 2 (at least 2*n) to avoid circular correlation artifacts.
+	fftSize := nextPow2(2 * n)
+	padded := make([]float64, fftSize)
+	copy(padded, mono.Samples)
+
+	// Forward FFT
+	X := fft.FFTReal(padded)
+
+	// Power spectrum: X * conj(X) = |X|²
+	for i := range X {
+		X[i] = complex(real(X[i])*real(X[i])+imag(X[i])*imag(X[i]), 0)
+	}
+
+	// Inverse FFT to get unnormalized autocorrelation
+	R := fft.IFFT(X)
+
+	// Precompute cumulative sum of squares for normalization.
+	// For lag τ, energyA = Σ x(t)² for t in [0, n-τ), energyB = Σ x(t+τ)² for t in [0, n-τ).
+	// Using prefix sums: energyA(τ) = prefixSq[n-τ], energyB(τ) = totalSq - prefixSq[τ]
+	// where prefixSq[k] = Σ x(i)² for i in [0,k) and totalSq - prefixSq[τ] accounts
+	// for the tail portion that only needs the overlap length.
+	prefixSq := make([]float64, n+1)
+	for i := 0; i < n; i++ {
+		prefixSq[i+1] = prefixSq[i] + mono.Samples[i]*mono.Samples[i]
+	}
 
 	bestLag := minLag
 	bestCorr := -1.0
 
+	totalLags := maxLag - minLag + 1
+	progressStep := totalLags / 20
+	if progressStep < 1 {
+		progressStep = 1
+	}
+
 	for lag := minLag; lag <= maxLag; lag++ {
-		overlapLen := n - lag
-		var sum, energyA, energyB float64
-		for t := 0; t < overlapLen; t++ {
-			a := mono.Samples[t]
-			b := mono.Samples[t+lag]
-			sum += a * b
-			energyA += a * a
-			energyB += b * b
+		if progressReporter != nil && (lag-minLag)%progressStep == 0 {
+			pct := float64(lag-minLag) / float64(totalLags) * 100
+			progressReporter(pct, "Scanning autocorrelation")
 		}
+		unnorm := real(R[lag])
+		// energyA = sum of x[0..n-lag)² = prefixSq[n-lag]
+		energyA := prefixSq[n-lag]
+		// energyB = sum of x[lag..n)² = prefixSq[n] - prefixSq[lag]
+		energyB := prefixSq[n] - prefixSq[lag]
 		denom := math.Sqrt(energyA * energyB)
 		if denom == 0 {
 			continue
 		}
-		corr := sum / denom
+		corr := unnorm / denom
 		if corr > bestCorr {
 			bestCorr = corr
 			bestLag = lag
@@ -227,7 +301,6 @@ func detectLoop(mono *MonoSignal, minLoopSec, maxLoopSec float64) *LoopResult {
 	loopDur := time.Duration(loopSec * float64(time.Second))
 	totalDur := time.Duration(float64(n) / float64(mono.SampleRate) * float64(time.Second))
 
-	// Loop starts at 0, ends at loop duration (the point where it repeats)
 	endDur := loopDur
 	if endDur > totalDur {
 		endDur = totalDur
@@ -240,6 +313,10 @@ func detectLoop(mono *MonoSignal, minLoopSec, maxLoopSec float64) *LoopResult {
 		Correlation: bestCorr,
 	}
 }
+
+// progressReporter is called during long operations with (percent, message).
+// Set to nil to disable progress reporting.
+var progressReporter func(pct float64, msg string)
 
 // MonoSignal holds a downsampled mono signal ready for analysis.
 type MonoSignal struct {
@@ -356,6 +433,10 @@ func extendAudio(pcm []byte, sampleRate int, loop *LoopResult, targetDur time.Du
 	out = append(out, loopBody...)
 
 	for len(out)/bytesPerFrame < targetFrames {
+		if progressReporter != nil {
+			pct := float64(len(out)/bytesPerFrame) / float64(targetFrames) * 100
+			progressReporter(pct, "Extending audio")
+		}
 		// Trim the crossfade region from the tail — it will be re-created
 		// as a blend of old tail + new head.
 		cfLen := crossfadeFrames
