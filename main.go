@@ -43,12 +43,86 @@ func main() {
 	monoDur := time.Duration(float64(len(mono.Samples)) / float64(mono.SampleRate) * float64(time.Second))
 	fmt.Printf("Mono signal:  %d samples @ %d Hz (%s)\n", len(mono.Samples), mono.SampleRate, monoDur.Round(time.Millisecond))
 
+	loop := detectLoop(mono, 10.0)
+	fmt.Printf("Loop start:   %s\n", loop.Start.Round(time.Millisecond))
+	fmt.Printf("Loop end:     %s\n", loop.End.Round(time.Millisecond))
+	fmt.Printf("Loop length:  %s\n", loop.Length.Round(time.Millisecond))
+	fmt.Printf("Correlation:  %.4f\n", loop.Correlation)
+
 	outputPath := inputPath[:len(inputPath)-len(".mp3")] + "_loop.mp3"
 	if err := encodeMP3(outputPath, stats); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Output:       %s\n", outputPath)
+}
+
+// LoopResult holds the detected loop boundaries and quality.
+type LoopResult struct {
+	Start       time.Duration
+	End         time.Duration
+	Length      time.Duration
+	Correlation float64
+}
+
+// detectLoop finds the longest repeating loop in the mono signal using
+// normalized autocorrelation. minLoopSec sets the minimum loop duration
+// in seconds; max is half the track length.
+func detectLoop(mono *MonoSignal, minLoopSec float64) *LoopResult {
+	n := len(mono.Samples)
+	minLag := int(minLoopSec * float64(mono.SampleRate))
+	maxLag := n / 2
+
+	if minLag >= maxLag {
+		// Track too short for loop detection — treat whole track as loop
+		dur := time.Duration(float64(n) / float64(mono.SampleRate) * float64(time.Second))
+		return &LoopResult{Start: 0, End: dur, Length: dur, Correlation: 0}
+	}
+
+	// Precompute the energy of the full overlap region for normalization.
+	// For lag τ, we compare samples [0..n-τ) with [τ..n).
+	// Normalized autocorrelation: r(τ) = Σ x(t)*x(t+τ) / sqrt(Σ x(t)² * Σ x(t+τ)²)
+
+	bestLag := minLag
+	bestCorr := -1.0
+
+	for lag := minLag; lag <= maxLag; lag++ {
+		overlapLen := n - lag
+		var sum, energyA, energyB float64
+		for t := 0; t < overlapLen; t++ {
+			a := mono.Samples[t]
+			b := mono.Samples[t+lag]
+			sum += a * b
+			energyA += a * a
+			energyB += b * b
+		}
+		denom := math.Sqrt(energyA * energyB)
+		if denom == 0 {
+			continue
+		}
+		corr := sum / denom
+		if corr > bestCorr {
+			bestCorr = corr
+			bestLag = lag
+		}
+	}
+
+	loopSec := float64(bestLag) / float64(mono.SampleRate)
+	loopDur := time.Duration(loopSec * float64(time.Second))
+	totalDur := time.Duration(float64(n) / float64(mono.SampleRate) * float64(time.Second))
+
+	// Loop starts at 0, ends at loop duration (the point where it repeats)
+	endDur := loopDur
+	if endDur > totalDur {
+		endDur = totalDur
+	}
+
+	return &LoopResult{
+		Start:       0,
+		End:         endDur,
+		Length:      loopDur,
+		Correlation: bestCorr,
+	}
 }
 
 // MonoSignal holds a downsampled mono signal ready for analysis.

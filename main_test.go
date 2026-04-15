@@ -121,6 +121,48 @@ func TestPcmToMono_Downsample(t *testing.T) {
 	}
 }
 
+func TestDetectLoop_SineWave(t *testing.T) {
+	// Generate a sine wave that repeats every 1 second at 1000 Hz sample rate.
+	// The autocorrelation should detect a ~1s loop.
+	rate := 1000
+	duration := 4 // seconds
+	n := rate * duration
+	samples := make([]float64, n)
+	period := 1.0 // 1 second loop
+	for i := 0; i < n; i++ {
+		// Sine wave with period of 1 second
+		samples[i] = math.Sin(2 * math.Pi * float64(i) / (period * float64(rate)))
+	}
+
+	mono := &MonoSignal{Samples: samples, SampleRate: rate}
+	result := detectLoop(mono, 0.5) // min loop 0.5s
+
+	// Should detect a loop close to 1.0 second
+	loopSec := result.Length.Seconds()
+	if loopSec < 0.9 || loopSec > 1.1 {
+		t.Errorf("expected loop ~1.0s, got %.3fs", loopSec)
+	}
+	if result.Correlation < 0.99 {
+		t.Errorf("expected high correlation, got %.4f", result.Correlation)
+	}
+}
+
+func TestDetectLoop_ShortTrack(t *testing.T) {
+	// Track shorter than min loop — should return whole track as loop
+	samples := make([]float64, 100)
+	mono := &MonoSignal{Samples: samples, SampleRate: 1000}
+	result := detectLoop(mono, 10.0) // min 10s, but track is 0.1s
+
+	if result.Correlation != 0 {
+		t.Errorf("expected correlation 0 for short track, got %.4f", result.Correlation)
+	}
+	expectedMs := 100.0 // 100 samples / 1000 Hz = 0.1s = 100ms
+	gotMs := result.Length.Seconds() * 1000
+	if math.Abs(gotMs-expectedMs) > 1 {
+		t.Errorf("expected length ~100ms, got %.1fms", gotMs)
+	}
+}
+
 func TestEncodeMP3_InvalidPath(t *testing.T) {
 	stats := &AudioStats{SampleRate: 44100, Channels: 2, PCM: []byte{0, 0, 0, 0}}
 	err := encodeMP3("/nonexistent/dir/out.mp3", stats)
