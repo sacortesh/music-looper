@@ -17,4 +17,6 @@ _No feedback recorded yet._
 - There is an mp3 called `sample1.mp3`
 - Autocorrelation loop detection uses brute-force O(n²) — works at 11025 Hz downsampled rate but will need FFT optimization (Task 7) for longer tracks.
 - Crossfade at loop junctions works by trimming cfLen frames from the output tail, then blending them with the head of the next loop iteration using linear interpolation. This avoids infinite-loop bugs where in-place blending doesn't grow the output.
-- `TestEncodeMP3_RoundTrip` times out (30s) when re-decoding lame-encoded output — pre-existing issue, possibly go-mp3 struggling with lame's output format.
+- `TestEncodeMP3_RoundTrip` times out (30s) when re-decoding lame-encoded output — pre-existing issue, possibly go-mp3 struggling with lame's output format. Updated timeout to 60s to accommodate.
+- CLI refactored from positional args to `flag.NewFlagSet` for extensibility. The `run()` function returns an exit code for testability, with `main()` as a thin wrapper.
+- Loop detection fallback: when autocorrelation peak is below 0.5, the tool falls back to looping the entire track rather than using a low-quality loop point.

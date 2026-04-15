@@ -6,9 +6,10 @@
 - [x] **Task 3**: Convert stereo PCM to mono float64 for analysis. `pcmToMono()` averages L+R, normalizes to [-1.0, 1.0], downsamples to 11025 Hz.
 - [x] **Task 4**: Loop detection via autocorrelation. `detectLoop()` computes normalized autocorrelation, finds best peak between min loop and half-track, reports start/end/length/correlation.
 - [x] **Task 5**: Audio extension by loop repetition. `extendAudio()` repeats detected loop body with 50ms crossfade at junctions, encodes extended PCM to output MP3.
+- [x] **Task 6**: Edge cases, validation, and CLI polish. Flag-based CLI (`--output`, `--min-loop`, `--max-loop`, `--crossfade`, `--dry-run`), input validation, low-correlation fallback to full-track loop.
 
 ## Test Counts
 | Type | Count |
 |------|-------|
-| Unit |  12   |
-| BDD  |  13   |
+| Unit |  18   |
+| BDD  |  16   |
