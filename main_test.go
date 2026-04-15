@@ -136,7 +136,7 @@ func TestDetectLoop_SineWave(t *testing.T) {
 	}
 
 	mono := &MonoSignal{Samples: samples, SampleRate: rate}
-	result := detectLoop(mono, 0.5) // min loop 0.5s
+	result := detectLoop(mono, 0.5, 0) // min loop 0.5s, no max
 
 	// Should detect a loop close to 1.0 second
 	loopSec := result.Length.Seconds()
@@ -152,7 +152,7 @@ func TestDetectLoop_ShortTrack(t *testing.T) {
 	// Track shorter than min loop — should return whole track as loop
 	samples := make([]float64, 100)
 	mono := &MonoSignal{Samples: samples, SampleRate: 1000}
-	result := detectLoop(mono, 10.0) // min 10s, but track is 0.1s
+	result := detectLoop(mono, 10.0, 0) // min 10s, but track is 0.1s
 
 	if result.Correlation != 0 {
 		t.Errorf("expected correlation 0 for short track, got %.4f", result.Correlation)
@@ -225,6 +225,63 @@ func TestExtendAudio_ShorterThanOriginal(t *testing.T) {
 	gotFrames := len(result) / 4
 	if gotFrames < frames {
 		t.Errorf("expected at least %d frames, got %d", frames, gotFrames)
+	}
+}
+
+func TestValidateInput_NotMp3(t *testing.T) {
+	err := validateInput("somefile.wav")
+	if err == nil {
+		t.Fatal("expected error for non-mp3 extension")
+	}
+}
+
+func TestValidateInput_NonexistentFile(t *testing.T) {
+	err := validateInput("nonexistent.mp3")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestParseTargetMinutes_Valid(t *testing.T) {
+	v, err := parseTargetMinutes("5.5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != 5.5 {
+		t.Errorf("expected 5.5, got %f", v)
+	}
+}
+
+func TestParseTargetMinutes_Invalid(t *testing.T) {
+	for _, s := range []string{"0", "-1", "abc", ""} {
+		_, err := parseTargetMinutes(s)
+		if err == nil {
+			t.Errorf("expected error for %q", s)
+		}
+	}
+}
+
+func TestDefaultOutputPath(t *testing.T) {
+	got := defaultOutputPath("/path/to/song.mp3")
+	want := "/path/to/song_loop.mp3"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestDetectLoop_MaxLoop(t *testing.T) {
+	// Sine wave with 1s period, 4s track. With max-loop=1.5s, should still find ~1s.
+	rate := 1000
+	n := rate * 4
+	samples := make([]float64, n)
+	for i := 0; i < n; i++ {
+		samples[i] = math.Sin(2 * math.Pi * float64(i) / float64(rate))
+	}
+	mono := &MonoSignal{Samples: samples, SampleRate: rate}
+	result := detectLoop(mono, 0.5, 1.5)
+	loopSec := result.Length.Seconds()
+	if loopSec < 0.9 || loopSec > 1.6 {
+		t.Errorf("expected loop ~1.0s (max 1.5s), got %.3fs", loopSec)
 	}
 }
 

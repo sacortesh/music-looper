@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"math"
 	"os"
-	"strconv"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hajimehoshi/go-mp3"
@@ -14,22 +16,61 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <input.mp3> <target-minutes>\n", os.Args[0])
-		os.Exit(1)
+	os.Exit(run(os.Args[1:]))
+}
+
+// run contains the main logic, returning an exit code. This makes testing easier.
+func run(args []string) int {
+	fs := flag.NewFlagSet("music-loop", flag.ContinueOnError)
+	output := fs.String("output", "", "output file path (default: <input>_loop.mp3)")
+	minLoop := fs.Float64("min-loop", 10.0, "minimum loop duration in seconds")
+	maxLoop := fs.Float64("max-loop", 0, "maximum loop duration in seconds (default: half track)")
+	crossfade := fs.Int("crossfade", 50, "crossfade duration in milliseconds")
+	dryRun := fs.Bool("dry-run", false, "analyze only, do not write output file")
+
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: music-loop [flags] <input.mp3> <target-minutes>\n\nFlags:\n")
+		fs.PrintDefaults()
 	}
 
-	inputPath := os.Args[1]
-	targetMinutes, err := strconv.ParseFloat(os.Args[2], 64)
-	if err != nil || targetMinutes <= 0 {
-		fmt.Fprintf(os.Stderr, "Error: target-minutes must be a positive number\n")
-		os.Exit(1)
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+
+	if fs.NArg() < 2 {
+		fs.Usage()
+		return 1
+	}
+
+	inputPath := fs.Arg(0)
+	targetMinutes, err := parseTargetMinutes(fs.Arg(1))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	if err := validateInput(inputPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+
+	if *minLoop < 0 {
+		fmt.Fprintf(os.Stderr, "Error: --min-loop must be non-negative\n")
+		return 1
+	}
+	if *maxLoop < 0 {
+		fmt.Fprintf(os.Stderr, "Error: --max-loop must be non-negative\n")
+		return 1
+	}
+	if *crossfade < 0 {
+		fmt.Fprintf(os.Stderr, "Error: --crossfade must be non-negative\n")
+		return 1
 	}
 
 	stats, err := decodeMP3(inputPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	fmt.Printf("Input:        %s\n", inputPath)
@@ -43,18 +84,38 @@ func main() {
 	monoDur := time.Duration(float64(len(mono.Samples)) / float64(mono.SampleRate) * float64(time.Second))
 	fmt.Printf("Mono signal:  %d samples @ %d Hz (%s)\n", len(mono.Samples), mono.SampleRate, monoDur.Round(time.Millisecond))
 
-	loop := detectLoop(mono, 10.0)
+	maxLoopSec := *maxLoop
+	if maxLoopSec <= 0 {
+		maxLoopSec = 0 // detectLoop will default to half-track
+	}
+
+	loop := detectLoop(mono, *minLoop, maxLoopSec)
+
+	if loop.Correlation < 0.5 {
+		fmt.Printf("Warning:      low correlation (%.4f), falling back to full-track loop\n", loop.Correlation)
+		dur := time.Duration(float64(len(mono.Samples)) / float64(mono.SampleRate) * float64(time.Second))
+		loop = &LoopResult{Start: 0, End: dur, Length: dur, Correlation: 0}
+	}
+
 	fmt.Printf("Loop start:   %s\n", loop.Start.Round(time.Millisecond))
 	fmt.Printf("Loop end:     %s\n", loop.End.Round(time.Millisecond))
 	fmt.Printf("Loop length:  %s\n", loop.Length.Round(time.Millisecond))
 	fmt.Printf("Correlation:  %.4f\n", loop.Correlation)
 
+	if *dryRun {
+		fmt.Println("Dry run — skipping output.")
+		return 0
+	}
+
 	targetDur := time.Duration(targetMinutes * float64(time.Minute))
-	extendedPCM := extendAudio(stats.PCM, stats.SampleRate, loop, targetDur, 50)
+	extendedPCM := extendAudio(stats.PCM, stats.SampleRate, loop, targetDur, *crossfade)
 	extendedDur := time.Duration(float64(len(extendedPCM)/4) / float64(stats.SampleRate) * float64(time.Second))
 	fmt.Printf("Extended:     %s\n", extendedDur.Round(time.Millisecond))
 
-	outputPath := inputPath[:len(inputPath)-len(".mp3")] + "_loop.mp3"
+	outputPath := *output
+	if outputPath == "" {
+		outputPath = defaultOutputPath(inputPath)
+	}
 	outStats := &AudioStats{
 		SampleRate:  stats.SampleRate,
 		Channels:    stats.Channels,
@@ -64,9 +125,46 @@ func main() {
 	}
 	if err := encodeMP3(outputPath, outStats); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	fmt.Printf("Output:       %s\n", outputPath)
+	return 0
+}
+
+// parseTargetMinutes parses and validates the target duration string.
+func parseTargetMinutes(s string) (float64, error) {
+	v, err := fmt.Sscanf(s, "%f", new(float64))
+	if err != nil || v == 0 {
+		return 0, fmt.Errorf("target-minutes must be a positive number, got %q", s)
+	}
+	var f float64
+	fmt.Sscanf(s, "%f", &f)
+	if f <= 0 {
+		return 0, fmt.Errorf("target-minutes must be a positive number, got %q", s)
+	}
+	return f, nil
+}
+
+// validateInput checks that the input file exists and has an .mp3 extension.
+func validateInput(path string) error {
+	if !strings.EqualFold(filepath.Ext(path), ".mp3") {
+		return fmt.Errorf("input file must have .mp3 extension: %s", path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("cannot access input file: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("input path is a directory, not a file: %s", path)
+	}
+	return nil
+}
+
+// defaultOutputPath generates the output path by appending _loop before the extension.
+func defaultOutputPath(inputPath string) string {
+	ext := filepath.Ext(inputPath)
+	base := strings.TrimSuffix(inputPath, ext)
+	return base + "_loop" + ext
 }
 
 // LoopResult holds the detected loop boundaries and quality.
@@ -79,11 +177,17 @@ type LoopResult struct {
 
 // detectLoop finds the longest repeating loop in the mono signal using
 // normalized autocorrelation. minLoopSec sets the minimum loop duration
-// in seconds; max is half the track length.
-func detectLoop(mono *MonoSignal, minLoopSec float64) *LoopResult {
+// in seconds; maxLoopSec sets the maximum (0 = half track length).
+func detectLoop(mono *MonoSignal, minLoopSec, maxLoopSec float64) *LoopResult {
 	n := len(mono.Samples)
 	minLag := int(minLoopSec * float64(mono.SampleRate))
 	maxLag := n / 2
+	if maxLoopSec > 0 {
+		userMax := int(maxLoopSec * float64(mono.SampleRate))
+		if userMax < maxLag {
+			maxLag = userMax
+		}
+	}
 
 	if minLag >= maxLag {
 		// Track too short for loop detection — treat whole track as loop
