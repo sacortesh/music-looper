@@ -19,11 +19,32 @@
 #   PRD.md      — Product Requirements Doc with phases & tasks
 #   progress.md — Tracks completed tasks and test counts
 #   lessons.md  — Records decisions, feedback, learnings (read every iteration)
-#   bdd/        — Gherkin integration tests, one .feature file per feature
+#   bdd/        — Gherkin integration tests, named NNN_feature-name.feature
 
-# jq stream filters
+# jq stream filter
 STREAM_TEXT='select(.type == "assistant").message.content[]? | select(.type == "text").text // empty'
-FINAL_RESULT='select(.type == "result").result // empty'
+
+# ---------------------------------------------------------------------------
+# Dependency checks
+# ---------------------------------------------------------------------------
+for dep in claude jq; do
+    if ! command -v "$dep" &>/dev/null; then
+        echo "Error: '$dep' is not installed or not in PATH." >&2
+        exit 1
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Signal handling — Ctrl+C cleanly exits the loop
+# ---------------------------------------------------------------------------
+TMPFILE=""
+
+cleanup() {
+    [ -n "$TMPFILE" ] && rm -f "$TMPFILE"
+}
+
+trap 'echo ""; echo "  Interrupted."; cleanup; exit 130' INT TERM
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -90,6 +111,12 @@ EOF
         created=1
     fi
 
+    if [ ! -d "bdd" ]; then
+        mkdir -p bdd
+        echo "  Created bdd/"
+        created=1
+    fi
+
     if [ ! -f "lessons.md" ]; then
         cat > lessons.md <<EOF
 # Lessons & Decisions
@@ -133,6 +160,70 @@ push_changes() {
 }
 
 # ---------------------------------------------------------------------------
+# Rate-limit detection — pause until the stated resume time
+# ---------------------------------------------------------------------------
+check_rate_limit() {
+    local tmpfile="$1"
+
+    # Search raw JSON stream for the rate-limit phrase
+    if ! grep -qi "you've hit your limit\|you have hit your limit\|rate limit exceeded" "$tmpfile" 2>/dev/null; then
+        return 1  # no rate limit detected
+    fi
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Rate limit reached."
+
+    # Extract time string: matches "until 3:00 PM", "after 3:00PM", "at 15:00", etc.
+    local raw
+    raw=$(cat "$tmpfile")
+
+    local time_str
+    time_str=$(echo "$raw" \
+        | grep -oiE '(until|after|at) [0-9]{1,2}:[0-9]{2} ?[APap][Mm]?' \
+        | grep -oiE '[0-9]{1,2}:[0-9]{2} ?[APap][Mm]?' \
+        | head -1)
+
+    if [ -n "$time_str" ]; then
+        # Ensure space before AM/PM (e.g. "3:00PM" → "3:00 PM")
+        time_str=$(echo "$time_str" | sed -E 's/([0-9])([AaPp][Mm])/\1 \2/')
+        local upper_time
+        upper_time=$(echo "$time_str" | tr '[:lower:]' '[:upper:]')
+
+        local today
+        today=$(date +%Y%m%d)
+        local target_epoch
+        # Try 12-hour format first (macOS date -j)
+        target_epoch=$(date -j -f "%Y%m%d %I:%M %p" "$today $upper_time" "+%s" 2>/dev/null)
+        # Fall back to 24-hour format
+        if [ -z "$target_epoch" ]; then
+            target_epoch=$(date -j -f "%Y%m%d %H:%M" "$today $time_str" "+%s" 2>/dev/null)
+        fi
+
+        local now_epoch
+        now_epoch=$(date +%s)
+
+        if [ -n "$target_epoch" ]; then
+            # If parsed time is already past, assume next day
+            [ "$target_epoch" -le "$now_epoch" ] && target_epoch=$((target_epoch + 86400))
+
+            local wait_secs=$((target_epoch - now_epoch))
+            local wait_mins=$((wait_secs / 60))
+            echo "  Resuming at $time_str (~${wait_mins} min). Press Ctrl+C to abort."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            sleep "$wait_secs"
+            return 0
+        fi
+    fi
+
+    # Fallback: no parseable time — wait 60 minutes
+    echo "  Resume time unknown — waiting 60 min. Press Ctrl+C to abort."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    sleep 3600
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Run init
 # ---------------------------------------------------------------------------
 init_project
@@ -160,43 +251,32 @@ You are a patient senior developer in a teaching session with a junior developer
 At the start of each task:
 1. Read PRD.md, progress.md, and lessons.md for full context.
 2. Identify the next incomplete task.
-3. Explain clearly what needs to be done and why — as if teaching.
+3. BEFORE asking the user to implement: guide them to write the BDD feature file first.
+   - Check existing files in bdd/ to determine the next sequence number (NNN).
+   - The file must be named bdd/NNN_<feature-name>.feature (e.g. bdd/003_user-login.feature).
+   - Write 1–3 minimal, manually-verifiable Gherkin scenarios together with the user.
+4. Explain clearly what needs to be done and why — as if teaching.
    Give hints, patterns to follow, and pointers to relevant files.
-   Do NOT write the code yourself; guide the user to write it.
-4. Ask the user to implement it and come back when done.
+   Do NOT write the implementation code yourself; guide the user to write it.
+5. Ask the user to implement it and come back when done.
 
 When the user says they are done:
-5. Run \`git diff\` (or inspect changed files) to review the implementation.
-6. Give detailed feedback:
+6. Run \`git diff\` (or inspect changed files) to review the implementation.
+7. Give detailed feedback:
    - What was done well
    - What could be improved or refactored
    - Any technical debt introduced
    - Topics the user should study to level up
-7. For backend or script code: check whether a Gherkin feature file exists in bdd/.
-   If not, guide the user to create bdd/<feature-name>.feature with 1–3 minimal
-   scenarios that a person can verify manually.
-8. Commit the changes with a clear message.
-9. Update progress.md: mark the task done, update test counts.
-10. Append any key decisions or learnings from this session to lessons.md.
-11. Ask the user if they want to continue to the next task.
+8. Re-read the BDD file created in step 3. Adjust scenarios if the implementation
+   changed the scope or behaviour.
+9. Commit the changes with a clear message.
+10. Update progress.md: mark the task done, update test counts.
+11. Append any key decisions or learnings from this session to lessons.md.
+12. Ask the user if they want to continue to the next task.
 
 WE ONLY DO ONE TASK AT A TIME."
     exit 0
 fi
-
-# ---------------------------------------------------------------------------
-# BDD / testing instructions injected into build & plan prompts
-# ---------------------------------------------------------------------------
-BDD_INSTRUCTIONS='Testing strategy:
-- Write unit tests only where they provide clear value (skip trivial boilerplate).
-- For any backend or script feature: create or update bdd/<feature-name>.feature
-  with Gherkin scenarios. Keep it minimal (1–3 scenarios) and manually verifiable.
-  Example:
-    Feature: User login
-      Scenario: Successful login with valid credentials
-        Given a registered user "alice" with password "secret"
-        When she submits the login form with correct credentials
-        Then she is redirected to the dashboard and sees a welcome message'
 
 # ---------------------------------------------------------------------------
 # Build / Plan prompts
@@ -205,12 +285,18 @@ if [ "$MODE" = "build" ]; then
     PROMPT="@PRD.md @progress.md @lessons.md
 1. Read PRD.md, progress.md, and lessons.md for full context including past decisions.
 2. Find the next incomplete task — the first one not yet marked done in progress.md.
-   If PRD.md has no tasks yet, add a first set of concrete tasks before implementing.
-3. Implement that single task with clean, minimal code.
-4. ${BDD_INSTRUCTIONS}
-5. Commit your changes with a descriptive message.
-6. Update progress.md: mark the task done, update test counts.
-7. If you made a significant decision or learned something worth preserving,
+   If PRD.md has no tasks yet, add a first set of concrete tasks before proceeding.
+3. BEFORE writing any implementation code, create the BDD feature file:
+   - List existing files in bdd/ to determine the next sequence number (NNN).
+   - Name the file bdd/NNN_<feature-name>.feature (e.g. bdd/004_detect-bpm.feature).
+   - Write 1–3 minimal, manually-verifiable Gherkin scenarios that define done for this task.
+4. Implement the task with clean, minimal code.
+   Write unit tests only where they provide clear value (skip trivial boilerplate).
+5. Re-read the BDD file from step 3. Adjust scenarios if the implementation changed
+   scope or behaviour so they stay accurate.
+6. Commit all changes with a descriptive message.
+7. Update progress.md: mark the task done, update test counts.
+8. If you made a significant decision or learned something worth preserving,
    append it to lessons.md under the appropriate section.
 ONLY DO ONE TASK PER ITERATION. Stop after committing and updating progress."
 
@@ -244,7 +330,6 @@ while true; do
     fi
 
     TMPFILE=$(mktemp)
-    trap "rm -f '$TMPFILE'" EXIT
 
     claude -p "$PROMPT" \
         --dangerously-skip-permissions \
@@ -256,6 +341,15 @@ while true; do
     | jq --unbuffered -rj "$STREAM_TEXT"
 
     echo ""
+
+    # Detect rate limit and pause until stated resume time
+    if check_rate_limit "$TMPFILE"; then
+        # Rate limit was hit and we slept — continue the loop (retry same task)
+        rm -f "$TMPFILE"; TMPFILE=""
+        continue
+    fi
+
+    rm -f "$TMPFILE"; TMPFILE=""
 
     push_changes
 

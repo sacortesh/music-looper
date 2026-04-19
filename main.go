@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/hajimehoshi/go-mp3"
-	"github.com/madelynnblue/go-dsp/fft"
 	"github.com/viert/go-lame"
 )
 
@@ -20,18 +19,29 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+// loopOptions holds all processing parameters shared between single and batch modes.
+type loopOptions struct {
+	minLoop   float64
+	maxLoop   float64
+	crossfade int
+	fadeOut   int
+	dryRun    bool
+	verbose   bool
+}
+
 // run contains the main logic, returning an exit code. This makes testing easier.
 func run(args []string) int {
 	fs := flag.NewFlagSet("music-loop", flag.ContinueOnError)
-	output := fs.String("output", "", "output file path (default: <input>_loop.mp3)")
+	output := fs.String("output", "", "output file or directory (default: <input>_loop.mp3, or <dir>/ for batch)")
 	minLoop := fs.Float64("min-loop", 10.0, "minimum loop duration in seconds")
 	maxLoop := fs.Float64("max-loop", 0, "maximum loop duration in seconds (default: half track)")
 	crossfade := fs.Int("crossfade", 50, "crossfade duration in milliseconds")
+	fadeOut := fs.Int("fade-out", 2000, "fade-out duration in milliseconds at the end of the output (0 to disable)")
 	dryRun := fs.Bool("dry-run", false, "analyze only, do not write output file")
 	verbose := fs.Bool("verbose", false, "print detailed progress information")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: music-loop [flags] <input.mp3> <target-minutes>\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, "Usage: music-loop [flags] <input.mp3|dir> <target-minutes>\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 
@@ -51,11 +61,6 @@ func run(args []string) int {
 		return 1
 	}
 
-	if err := validateInput(inputPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
-	}
-
 	if *minLoop < 0 {
 		fmt.Fprintf(os.Stderr, "Error: --min-loop must be non-negative\n")
 		return 1
@@ -69,13 +74,104 @@ func run(args []string) int {
 		return 1
 	}
 
-	if *verbose {
+	opts := loopOptions{
+		minLoop:   *minLoop,
+		maxLoop:   *maxLoop,
+		crossfade: *crossfade,
+		fadeOut:   *fadeOut,
+		dryRun:    *dryRun,
+		verbose:   *verbose,
+	}
+
+	// Batch mode: input is a directory
+	info, err := os.Stat(inputPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot access input: %v\n", err)
+		return 1
+	}
+	if info.IsDir() {
+		return runBatch(inputPath, *output, targetMinutes, opts)
+	}
+
+	// Single-file mode
+	if err := validateInput(inputPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	outPath := *output
+	if outPath == "" {
+		outPath = defaultOutputPath(inputPath)
+	}
+	if err := processFile(inputPath, outPath, targetMinutes, opts); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// runBatch processes all .mp3 files in inputDir. If outputDir is non-empty,
+// output files are written there; otherwise they are placed alongside each source file.
+func runBatch(inputDir, outputDir string, targetMinutes float64, opts loopOptions) int {
+	entries, err := os.ReadDir(inputDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot read directory %s: %v\n", inputDir, err)
+		return 1
+	}
+
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".mp3") {
+			files = append(files, filepath.Join(inputDir, e.Name()))
+		}
+	}
+
+	if len(files) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: no .mp3 files found in %s\n", inputDir)
+		return 1
+	}
+
+	if outputDir != "" {
+		if err := os.MkdirAll(outputDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot create output directory %s: %v\n", outputDir, err)
+			return 1
+		}
+	}
+
+	fmt.Printf("Batch:        %d file(s) in %s\n", len(files), inputDir)
+	if outputDir != "" {
+		fmt.Printf("Output dir:   %s\n", outputDir)
+	}
+	fmt.Println()
+
+	failures := 0
+	for i, f := range files {
+		fmt.Printf("── [%d/%d] %s\n", i+1, len(files), filepath.Base(f))
+		outPath := defaultOutputPath(f)
+		if outputDir != "" {
+			outPath = filepath.Join(outputDir, filepath.Base(defaultOutputPath(f)))
+		}
+		if err := processFile(f, outPath, targetMinutes, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "  Failed: %v\n", err)
+			failures++
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("Batch done:   %d succeeded, %d failed\n", len(files)-failures, failures)
+	if failures > 0 {
+		return 1
+	}
+	return 0
+}
+
+// processFile runs the full loop-extension pipeline for a single MP3 file.
+func processFile(inputPath, outputPath string, targetMinutes float64, opts loopOptions) error {
+	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "[verbose] Decoding %s...\n", inputPath)
 	}
 	stats, err := decodeMP3(inputPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+		return err
 	}
 
 	fmt.Printf("Input:        %s\n", inputPath)
@@ -85,20 +181,17 @@ func run(args []string) int {
 	fmt.Printf("Samples:      %d\n", stats.SampleCount)
 	fmt.Printf("Target:       %.1f minutes\n", targetMinutes)
 
-	if *verbose {
+	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "[verbose] Converting to mono and downsampling to 11025 Hz...\n")
 	}
 	mono := pcmToMono(stats.PCM, stats.SampleRate, 11025)
 	monoDur := time.Duration(float64(len(mono.Samples)) / float64(mono.SampleRate) * float64(time.Second))
 	fmt.Printf("Mono signal:  %d samples @ %d Hz (%s)\n", len(mono.Samples), mono.SampleRate, monoDur.Round(time.Millisecond))
 
-	maxLoopSec := *maxLoop
-	if maxLoopSec <= 0 {
-		maxLoopSec = 0 // detectLoop will default to half-track
-	}
+	maxLoopSec := opts.maxLoop
 
-	if *verbose {
-		fmt.Fprintf(os.Stderr, "[verbose] Detecting loop (FFT-based autocorrelation, %d samples)...\n", len(mono.Samples))
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Detecting loop (energy-envelope loop-point search, %d samples)...\n", len(mono.Samples))
 		lastPct := -1
 		progressReporter = func(pct float64, msg string) {
 			iPct := int(pct)
@@ -111,8 +204,8 @@ func run(args []string) int {
 		progressReporter = nil
 	}
 	t0 := time.Now()
-	loop := detectLoop(mono, *minLoop, maxLoopSec)
-	if *verbose {
+	loop := detectLoop(mono, opts.minLoop, maxLoopSec)
+	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "\r[verbose] Loop detection completed in %s\n", time.Since(t0).Round(time.Millisecond))
 	}
 
@@ -127,26 +220,22 @@ func run(args []string) int {
 	fmt.Printf("Loop length:  %s\n", loop.Length.Round(time.Millisecond))
 	fmt.Printf("Correlation:  %.4f\n", loop.Correlation)
 
-	if *dryRun {
+	if opts.dryRun {
 		fmt.Println("Dry run — skipping output.")
-		return 0
+		return nil
 	}
 
 	targetDur := time.Duration(targetMinutes * float64(time.Minute))
-	if *verbose {
-		fmt.Fprintf(os.Stderr, "[verbose] Extending audio to %s with %dms crossfade...\n", targetDur.Round(time.Millisecond), *crossfade)
+	if opts.verbose {
+		fmt.Fprintf(os.Stderr, "[verbose] Extending audio to %s with %dms crossfade...\n", targetDur.Round(time.Millisecond), opts.crossfade)
 	}
-	extendedPCM := extendAudio(stats.PCM, stats.SampleRate, loop, targetDur, *crossfade)
-	if *verbose {
+	extendedPCM := extendAudio(stats.PCM, stats.SampleRate, loop, targetDur, opts.crossfade, opts.fadeOut)
+	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "\r[progress] Extending audio... 100%%\n")
 	}
 	extendedDur := time.Duration(float64(len(extendedPCM)/4) / float64(stats.SampleRate) * float64(time.Second))
 	fmt.Printf("Extended:     %s\n", extendedDur.Round(time.Millisecond))
 
-	outputPath := *output
-	if outputPath == "" {
-		outputPath = defaultOutputPath(inputPath)
-	}
 	outStats := &AudioStats{
 		SampleRate:  stats.SampleRate,
 		Channels:    stats.Channels,
@@ -154,18 +243,17 @@ func run(args []string) int {
 		SampleCount: int64(len(extendedPCM) / 4),
 		PCM:         extendedPCM,
 	}
-	if *verbose {
+	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "[verbose] Encoding MP3 to %s...\n", outputPath)
 	}
 	if err := encodeMP3(outputPath, outStats); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return 1
+		return err
 	}
 	fmt.Printf("Output:       %s\n", outputPath)
-	if *verbose {
+	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "[verbose] Done.\n")
 	}
-	return 0
+	return nil
 }
 
 // parseTargetMinutes parses and validates the target duration string.
@@ -212,106 +300,160 @@ type LoopResult struct {
 	Correlation float64
 }
 
-// nextPow2 returns the smallest power of 2 >= n.
-func nextPow2(n int) int {
-	p := 1
-	for p < n {
-		p <<= 1
-	}
-	return p
-}
-
-// detectLoop finds the longest repeating loop in the mono signal using
-// FFT-based normalized autocorrelation. minLoopSec sets the minimum loop
-// duration in seconds; maxLoopSec sets the maximum (0 = half track length).
+// detectLoop finds the best loop start and end points in the mono signal.
+//
+// Strategy: compare energy envelopes between candidate loop-end positions (near the
+// end of the song) and candidate loop-start positions (earlier in the song). The
+// score balances similarity (Pearson correlation of 5-second energy windows) against
+// loop length, strongly favouring longer loops. This produces the semantic the user
+// expects: an intro that plays once followed by a long repeating body.
+//
+// minLoopSec sets the minimum loop duration; maxLoopSec sets the maximum (0 = full track).
 func detectLoop(mono *MonoSignal, minLoopSec, maxLoopSec float64) *LoopResult {
 	n := len(mono.Samples)
-	minLag := int(minLoopSec * float64(mono.SampleRate))
-	maxLag := n / 2
-	if maxLoopSec > 0 {
-		userMax := int(maxLoopSec * float64(mono.SampleRate))
-		if userMax < maxLag {
-			maxLag = userMax
+	sr := mono.SampleRate
+	totalSec := float64(n) / float64(sr)
+	totalDur := time.Duration(totalSec * float64(time.Second))
+
+	// Energy envelope: RMS over 500ms hops.
+	hopSec := 0.5
+	hopSamples := int(hopSec * float64(sr))
+	if hopSamples < 1 {
+		hopSamples = 1
+	}
+	numHops := n / hopSamples
+	if numHops < 4 {
+		return &LoopResult{Start: 0, End: totalDur, Length: totalDur, Correlation: 0}
+	}
+
+	envelope := make([]float64, numHops)
+	for i := range envelope {
+		start := i * hopSamples
+		end := start + hopSamples
+		if end > n {
+			end = n
 		}
+		sum := 0.0
+		for _, s := range mono.Samples[start:end] {
+			sum += s * s
+		}
+		envelope[i] = math.Sqrt(sum / float64(end-start))
 	}
 
-	if minLag >= maxLag {
-		dur := time.Duration(float64(n) / float64(mono.SampleRate) * float64(time.Second))
-		return &LoopResult{Start: 0, End: dur, Length: dur, Correlation: 0}
+	minLoopHops := int(math.Ceil(minLoopSec / hopSec))
+	maxLoopHops := numHops
+	if maxLoopSec > 0 {
+		maxLoopHops = int(math.Floor(maxLoopSec / hopSec))
+	}
+	if minLoopHops >= maxLoopHops {
+		return &LoopResult{Start: 0, End: totalDur, Length: totalDur, Correlation: 0}
 	}
 
-	// FFT-based autocorrelation: R(τ) = IFFT(|FFT(x)|²)
-	// Pad to next power of 2 (at least 2*n) to avoid circular correlation artifacts.
-	fftSize := nextPow2(2 * n)
-	padded := make([]float64, fftSize)
-	copy(padded, mono.Samples)
-
-	// Forward FFT
-	X := fft.FFTReal(padded)
-
-	// Power spectrum: X * conj(X) = |X|²
-	for i := range X {
-		X[i] = complex(real(X[i])*real(X[i])+imag(X[i])*imag(X[i]), 0)
+	// Comparison window: 5 seconds worth of hops (10 hops).
+	winHops := 10
+	if winHops > numHops/10 {
+		winHops = numHops / 10
+	}
+	if winHops < 2 {
+		winHops = 2
 	}
 
-	// Inverse FFT to get unnormalized autocorrelation
-	R := fft.IFFT(X)
+	// Try 10 loop-end candidates spread from 80% to 98% of the song.
+	// For each, scan all valid loop-start positions and pick the best
+	// (start, end) pair by score = 0.4*correlation + 0.6*lengthFraction.
+	// Weighting length at 60% ensures we strongly prefer long loops.
+	const numEndCandidates = 10
+	bestScore := -math.MaxFloat64
+	bestStartSample := 0
+	bestEndSample := n
+	bestCorr := 0.0
 
-	// Precompute cumulative sum of squares for normalization.
-	// For lag τ, energyA = Σ x(t)² for t in [0, n-τ), energyB = Σ x(t+τ)² for t in [0, n-τ).
-	// Using prefix sums: energyA(τ) = prefixSq[n-τ], energyB(τ) = totalSq - prefixSq[τ]
-	// where prefixSq[k] = Σ x(i)² for i in [0,k) and totalSq - prefixSq[τ] accounts
-	// for the tail portion that only needs the overlap length.
-	prefixSq := make([]float64, n+1)
-	for i := 0; i < n; i++ {
-		prefixSq[i+1] = prefixSq[i] + mono.Samples[i]*mono.Samples[i]
-	}
-
-	bestLag := minLag
-	bestCorr := -1.0
-
-	totalLags := maxLag - minLag + 1
-	progressStep := totalLags / 20
+	totalIter := numEndCandidates * numHops
+	progressStep := totalIter / 20
 	if progressStep < 1 {
 		progressStep = 1
 	}
+	progressCount := 0
 
-	for lag := minLag; lag <= maxLag; lag++ {
-		if progressReporter != nil && (lag-minLag)%progressStep == 0 {
-			pct := float64(lag-minLag) / float64(totalLags) * 100
-			progressReporter(pct, "Scanning autocorrelation")
+	for ei := 0; ei < numEndCandidates; ei++ {
+		fraction := 0.80 + float64(ei)/float64(numEndCandidates-1)*0.18
+		endHop := int(fraction * float64(numHops))
+		if endHop+winHops > numHops {
+			endHop = numHops - winHops
 		}
-		unnorm := real(R[lag])
-		// energyA = sum of x[0..n-lag)² = prefixSq[n-lag]
-		energyA := prefixSq[n-lag]
-		// energyB = sum of x[lag..n)² = prefixSq[n] - prefixSq[lag]
-		energyB := prefixSq[n] - prefixSq[lag]
-		denom := math.Sqrt(energyA * energyB)
-		if denom == 0 {
+		if endHop < winHops {
 			continue
 		}
-		corr := unnorm / denom
-		if corr > bestCorr {
-			bestCorr = corr
-			bestLag = lag
+		endWin := envelope[endHop : endHop+winHops]
+		maxStartHop := endHop - minLoopHops
+		if maxStartHop < 0 {
+			continue
+		}
+
+		for startHop := 0; startHop <= maxStartHop; startHop++ {
+			progressCount++
+			if progressReporter != nil && progressCount%progressStep == 0 {
+				pct := float64(progressCount) / float64(totalIter) * 100
+				progressReporter(pct, "Scanning loop points")
+			}
+			if startHop+winHops > numHops {
+				break
+			}
+			corr := pearsonCorr(envelope[startHop:startHop+winHops], endWin)
+
+			loopHops := endHop - startHop
+			lengthFrac := float64(loopHops) / float64(maxLoopHops)
+			if lengthFrac > 1.0 {
+				lengthFrac = 1.0
+			}
+			score := corr*0.4 + lengthFrac*0.6
+
+			if score > bestScore {
+				bestScore = score
+				bestStartSample = startHop * hopSamples
+				bestEndSample = endHop * hopSamples
+				bestCorr = corr
+			}
 		}
 	}
 
-	loopSec := float64(bestLag) / float64(mono.SampleRate)
-	loopDur := time.Duration(loopSec * float64(time.Second))
-	totalDur := time.Duration(float64(n) / float64(mono.SampleRate) * float64(time.Second))
-
-	endDur := loopDur
-	if endDur > totalDur {
-		endDur = totalDur
-	}
-
+	startDur := time.Duration(float64(bestStartSample) / float64(sr) * float64(time.Second))
+	endDur := time.Duration(float64(bestEndSample) / float64(sr) * float64(time.Second))
 	return &LoopResult{
-		Start:       0,
+		Start:       startDur,
 		End:         endDur,
-		Length:      loopDur,
+		Length:      endDur - startDur,
 		Correlation: bestCorr,
 	}
+}
+
+// pearsonCorr returns the Pearson correlation coefficient of two equal-length slices.
+// Returns 0 if either slice has zero variance.
+func pearsonCorr(a, b []float64) float64 {
+	n := len(a)
+	if n == 0 || n != len(b) {
+		return 0
+	}
+	var ma, mb float64
+	for i := range a {
+		ma += a[i]
+		mb += b[i]
+	}
+	ma /= float64(n)
+	mb /= float64(n)
+	var sa, sb, cov float64
+	for i := range a {
+		da := a[i] - ma
+		db := b[i] - mb
+		sa += da * da
+		sb += db * db
+		cov += da * db
+	}
+	denom := math.Sqrt(sa * sb)
+	if denom == 0 {
+		return 0
+	}
+	return cov / denom
 }
 
 // progressReporter is called during long operations with (percent, message).
@@ -401,8 +543,9 @@ func decodeMP3(path string) (*AudioStats, error) {
 }
 
 // extendAudio repeats the detected loop to fill targetDur, applying a
-// crossfade of crossfadeMs milliseconds at each loop junction.
-func extendAudio(pcm []byte, sampleRate int, loop *LoopResult, targetDur time.Duration, crossfadeMs int) []byte {
+// crossfade of crossfadeMs milliseconds at each loop junction, and a
+// linear fade-out of fadeOutMs milliseconds at the very end.
+func extendAudio(pcm []byte, sampleRate int, loop *LoopResult, targetDur time.Duration, crossfadeMs, fadeOutMs int) []byte {
 	bytesPerFrame := 4 // stereo 16-bit
 	totalFrames := len(pcm) / bytesPerFrame
 	targetFrames := int(targetDur.Seconds() * float64(sampleRate))
@@ -480,6 +623,25 @@ func extendAudio(pcm []byte, sampleRate int, loop *LoopResult, targetDur time.Du
 		}
 
 		out = append(out, nextIter...)
+	}
+
+	// Apply linear fade-out to the last fadeOutMs milliseconds.
+	if fadeOutMs > 0 {
+		fadeFrames := fadeOutMs * sampleRate / 1000
+		totalOut := len(out) / bytesPerFrame
+		if fadeFrames > totalOut {
+			fadeFrames = totalOut
+		}
+		fadeStart := totalOut - fadeFrames
+		for i := 0; i < fadeFrames; i++ {
+			alpha := 1.0 - float64(i)/float64(fadeFrames) // 1→0
+			fOff := (fadeStart + i) * bytesPerFrame
+			for ch := 0; ch < 2; ch++ {
+				idx := fOff + ch*2
+				val := int16(binary.LittleEndian.Uint16(out[idx : idx+2]))
+				binary.LittleEndian.PutUint16(out[idx:idx+2], uint16(int16(float64(val)*alpha)))
+			}
+		}
 	}
 
 	return out
