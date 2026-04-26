@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# avangardespec — CLI entrypoint for the Avangarde Harness
+#
+# Usage:
+#   avangardespec [--verbose] <subcommand>
+#
+# Subcommands:
+#   init       Initialize harness in current directory
+#   plan       Create/update phased task list
+#   scope      Add a new task or feature to the plan
+#   pre-task   Prepare BDD spec and branch for next task
+#   task       Run Ralph loop (sensors + AI coding cycle)
+#   close      Close current task after sensors pass
+#   help       Show this help message
+
+set -euo pipefail
+
+# ── Locate scripts directory ───────────────────────────────────────────────────
+_SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$_SCRIPT_PATH" ]]; do
+  _SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_PATH")" && pwd)"
+  _SCRIPT_PATH="$(readlink "$_SCRIPT_PATH")"
+  [[ "$_SCRIPT_PATH" != /* ]] && _SCRIPT_PATH="$_SCRIPT_DIR/$_SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_SCRIPT_PATH")" && pwd)"
+unset _SCRIPT_PATH _SCRIPT_DIR
+
+find_scripts_dir() {
+  if [[ -d "harness/scripts" && -f "harness/scripts/avangardespec" ]]; then
+    echo "$(pwd)/harness/scripts"
+  else
+    echo "$SCRIPT_DIR"
+  fi
+}
+
+SCRIPTS="$(find_scripts_dir)"
+
+# ── Parse flags ────────────────────────────────────────────────────────────────
+# Strip --verbose / -v before routing, export for all child scripts via env var.
+HARNESS_VERBOSE="${HARNESS_VERBOSE:-0}"
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --verbose|-v) HARNESS_VERBOSE=1 ;;
+    *)            ARGS+=("$arg") ;;
+  esac
+done
+export HARNESS_VERBOSE
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+# ── Help ───────────────────────────────────────────────────────────────────────
+show_help() {
+  cat <<EOF
+
+  avangardespec — Avangarde Harness CLI
+
+  Usage: avangardespec [--verbose] <subcommand>
+
+  Subcommands:
+    init       Initialize harness in current directory (run once)
+    adopt      Retrofit harness onto an existing project
+    sync       Re-copy harness scripts into harness/scripts/ (no wizard)
+    plan       Create or refresh the phased task list
+    scope      Add a new task or feature mid-project
+    pre-task   Prepare BDD spec + branch for the next task
+    task       Run the Ralph loop (AI coding + sensors)
+    close      Close the current task after sensors pass
+    help       Show this message
+
+  Flags:
+    --verbose, -v   Print captured input after each prompt for debugging
+
+  Typical workflow:
+    avangardespec init
+    avangardespec plan
+    avangardespec pre-task
+    avangardespec task
+    avangardespec close
+
+EOF
+}
+
+# ── Router ─────────────────────────────────────────────────────────────────────
+SUBCOMMAND="${1:-help}"
+
+case "$SUBCOMMAND" in
+  init)
+    exec bash "$SCRIPTS/init-project.sh" "${@:2}"
+    ;;
+  adopt)
+    exec bash "$SCRIPTS/adopt-project.sh" "${@:2}"
+    ;;
+  sync)
+    # Always use the canonical repo scripts, never the local harness/scripts/ copy
+    exec bash "$SCRIPT_DIR/init-project.sh" --sync-scripts
+    ;;
+  plan)
+    exec bash "$SCRIPTS/plan-add-scope.sh" --mode=plan "${@:2}"
+    ;;
+  scope)
+    exec bash "$SCRIPTS/plan-add-scope.sh" --mode=scope "${@:2}"
+    ;;
+  pre-task)
+    exec bash "$SCRIPTS/execute-pre-task.sh" "${@:2}"
+    ;;
+  task)
+    exec bash "$SCRIPTS/execute-task.sh" "${@:2}"
+    ;;
+  close)
+    exec bash "$SCRIPTS/closure-task.sh" "${@:2}"
+    ;;
+  help|--help|-h)
+    show_help
+    ;;
+  *)
+    echo "Unknown subcommand: $SUBCOMMAND" >&2
+    show_help
+    exit 1
+    ;;
+esac
