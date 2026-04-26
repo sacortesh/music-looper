@@ -2,3 +2,18 @@ music-loop
 *.mp3
 .claude/
 ralph.sh
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+vendor/
+
+# Environment and editor noise
+.env
+*.env.*
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hajimehoshi/go-mp3"
+	"github.com/madelynnblue/go-dsp/fft"
 	"github.com/viert/go-lame"
 )
 
@@ -884,10 +885,22 @@ func analyzeFile(path string) (*TrackAnalysis, error) {
 	return a, nil
 }
 
-// estimateBPM estimates tempo in BPM via onset-strength autocorrelation at 50ms hops.
-// The result is a rough estimate — may be off by a factor of 2 on complex rhythms.
+// nextPow2 returns the smallest power of 2 >= n.
+func nextPow2(n int) int {
+	if n <= 1 {
+		return 1
+	}
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
+}
+
+// estimateBPM estimates tempo in BPM via FFT on the onset-flux envelope at 50ms hops.
+// Returns 0.0 and logs a warning if the signal is too short or silent for FFT windowing.
 func estimateBPM(mono *MonoSignal) float64 {
-	const hopSec = 0.05 // 50ms — fine enough to resolve 50–220 BPM
+	const hopSec = 0.05 // 50ms → onset envelope at 20 Hz
 	hopSamples := int(hopSec * float64(mono.SampleRate))
 	if hopSamples < 1 {
 		hopSamples = 1
@@ -895,7 +908,8 @@ func estimateBPM(mono *MonoSignal) float64 {
 	n := len(mono.Samples)
 	numHops := n / hopSamples
 	if numHops < 10 {
-		return 0
+		fmt.Fprintf(os.Stderr, "warning: signal too short for BPM FFT analysis\n")
+		return 0.0
 	}
 
 	// RMS energy per 50ms hop.
@@ -913,7 +927,19 @@ func estimateBPM(mono *MonoSignal) float64 {
 		energy[i] = math.Sqrt(sum / float64(end-start))
 	}
 
-	// Onset strength: positive energy increases frame-to-frame.
+	// Check for silence.
+	maxE := 0.0
+	for _, e := range energy {
+		if e > maxE {
+			maxE = e
+		}
+	}
+	if maxE < 1e-8 {
+		fmt.Fprintf(os.Stderr, "warning: signal is silent, cannot estimate BPM via FFT\n")
+		return 0.0
+	}
+
+	// Onset flux: half-wave rectified first-order difference of energy envelope.
 	onset := make([]float64, numHops)
 	for i := 1; i < numHops; i++ {
 		if d := energy[i] - energy[i-1]; d > 0 {
@@ -921,28 +947,45 @@ func estimateBPM(mono *MonoSignal) float64 {
 		}
 	}
 
-	// Autocorrelation over the 50–220 BPM lag range.
-	minLag := int(math.Round(60.0 / 220.0 / hopSec)) // ~220 BPM
-	maxLag := int(math.Round(60.0 / 50.0 / hopSec))  //  ~50 BPM
-	if minLag < 1 {
-		minLag = 1
+	// Zero-pad to next power of 2 and apply FFT.
+	fftSize := nextPow2(numHops)
+	padded := make([]float64, fftSize)
+	copy(padded, onset)
+	spectrum := fft.FFTReal(padded)
+
+	// Onset envelope sample rate = hopRate = 1/hopSec = 20 Hz.
+	// Bin k → frequency = k * hopRate / fftSize Hz → BPM = freq * 60.
+	// Valid BPM range [40, 240] → freq [40/60, 240/60] Hz.
+	hopRate := 1.0 / hopSec
+	kMin := int(math.Ceil(40.0 / 60.0 * float64(fftSize) / hopRate))
+	kMax := int(math.Floor(240.0 / 60.0 * float64(fftSize) / hopRate))
+	if kMin < 1 {
+		kMin = 1
 	}
-	if maxLag >= numHops {
-		maxLag = numHops - 1
+	if kMax >= fftSize/2 {
+		kMax = fftSize/2 - 1
+	}
+	if kMin > kMax {
+		fmt.Fprintf(os.Stderr, "warning: FFT bin range invalid, cannot estimate BPM\n")
+		return 0.0
 	}
 
-	bestLag, bestVal := minLag, -1.0
-	for lag := minLag; lag <= maxLag; lag++ {
-		sum := 0.0
-		for i := 0; i+lag < numHops; i++ {
-			sum += onset[i] * onset[i+lag]
-		}
-		if sum > bestVal {
-			bestVal = sum
-			bestLag = lag
+	bestK, bestMag := kMin, 0.0
+	for k := kMin; k <= kMax; k++ {
+		c := spectrum[k]
+		mag := math.Sqrt(real(c)*real(c) + imag(c)*imag(c))
+		if mag > bestMag {
+			bestMag = mag
+			bestK = k
 		}
 	}
-	return 60.0 / (float64(bestLag) * hopSec)
+
+	bpm := float64(bestK) * hopRate / float64(fftSize) * 60.0
+	if bpm < 40.0 || bpm > 240.0 {
+		fmt.Fprintf(os.Stderr, "warning: FFT returned out-of-range BPM %.1f, using fallback\n", bpm)
+		return 0.0
+	}
+	return bpm
 }
 
 // computeEnergyCV returns the coefficient of variation (std/mean) of the envelope.

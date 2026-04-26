@@ -22,11 +22,10 @@ run_check() {
 }
 echo "Running sensors..."
 # ── Add checks below ──────────────────────────────────────────────────────────
-```bash
-run_check "go-dsp not in go.mod" bash -c "! grep -q 'go-dsp\|mjibson' go.mod"
-run_check "no FFT import in source" bash -c "! grep -rq 'go-dsp\|mjibson/dsp\|fft\\.FFT' --include='*.go' ."
-run_check "BPM uses heuristic autocorrelation" bash -c "grep -q 'estimateBPM' main.go"
-```
+run_check "go-dsp in go.mod" bash -c "grep -q 'go-dsp' go.mod"
+run_check "fft import in source" bash -c "grep -rq 'go-dsp/fft' --include='*.go' ."
+run_check "nextPow2 function defined" bash -c "grep -q 'func nextPow2' main.go"
+run_check "estimateBPM calls fft.FFTReal" bash -c "grep -q 'fft.FFTReal' main.go"
 
 # ── End sensors ───────────────────────────────────────────────────────────────
 echo ""
