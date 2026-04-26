@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,14 +40,37 @@ func run(args []string) int {
 	fadeOut := fs.Int("fade-out", 2000, "fade-out duration in milliseconds at the end of the output (0 to disable)")
 	dryRun := fs.Bool("dry-run", false, "analyze only, do not write output file")
 	verbose := fs.Bool("verbose", false, "print detailed progress information")
+	analyze := fs.Bool("analyze", false, "score track(s) for concentration/focus loop suitability and output a markdown table")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: music-loop [flags] <input.mp3|dir> <target-minutes>\n\nFlags:\n")
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  music-loop [flags] <input.mp3|dir> <target-minutes>  — extend to target duration\n")
+		fmt.Fprintf(os.Stderr, "  music-loop --analyze <input.mp3|dir>                 — score tracks for focus suitability\n")
+		fmt.Fprintf(os.Stderr, "\nFlags:\n")
 		fs.PrintDefaults()
 	}
 
 	if err := fs.Parse(args); err != nil {
 		return 1
+	}
+
+	// Analyze mode: score one file or a whole directory, no target duration needed.
+	if *analyze {
+		if fs.NArg() < 1 {
+			fmt.Fprintf(os.Stderr, "Error: --analyze requires an input file or directory\n")
+			fs.Usage()
+			return 1
+		}
+		inputPath := fs.Arg(0)
+		info, err := os.Stat(inputPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: cannot access input: %v\n", err)
+			return 1
+		}
+		if info.IsDir() {
+			return runAnalyzeBatch(inputPath)
+		}
+		return runAnalyzeSingle(inputPath)
 	}
 
 	if fs.NArg() < 2 {
@@ -358,26 +382,90 @@ func detectLoop(mono *MonoSignal, minLoopSec, maxLoopSec float64) *LoopResult {
 		winHops = 2
 	}
 
-	// Try 10 loop-end candidates spread from 80% to 98% of the song.
-	// For each, scan all valid loop-start positions and pick the best
-	// (start, end) pair by score = 0.4*correlation + 0.6*lengthFraction.
-	// Weighting length at 60% ensures we strongly prefer long loops.
+	// Smooth the envelope over ±3 hops before finding quiet moments,
+	// so single-hop spikes don't dominate the minima search.
+	const smoothRadius = 3
+	smoothed := make([]float64, numHops)
+	for i := range smoothed {
+		lo, hi := i-smoothRadius, i+smoothRadius
+		if lo < 0 {
+			lo = 0
+		}
+		if hi >= numHops {
+			hi = numHops - 1
+		}
+		sum := 0.0
+		for j := lo; j <= hi; j++ {
+			sum += envelope[j]
+		}
+		smoothed[i] = sum / float64(hi-lo+1)
+	}
+
+	// Collect end candidates: the quietest positions in the 80–98% range,
+	// with at least winHops separation so they don't cluster together.
+	// Quiet moments (phrase endings, note decays, rests) make much better
+	// loop boundaries than arbitrarily spaced positions.
 	const numEndCandidates = 10
+	searchStart := int(0.80 * float64(numHops))
+	searchEnd := int(0.98 * float64(numHops))
+	if searchEnd+winHops > numHops {
+		searchEnd = numHops - winHops
+	}
+
+	type hopCandidate struct {
+		hop    int
+		energy float64
+	}
+	allHops := make([]hopCandidate, 0, searchEnd-searchStart+1)
+	for i := searchStart; i <= searchEnd; i++ {
+		allHops = append(allHops, hopCandidate{i, smoothed[i]})
+	}
+	sort.Slice(allHops, func(i, j int) bool {
+		return allHops[i].energy < allHops[j].energy
+	})
+
+	endCandidates := make([]int, 0, numEndCandidates)
+	for _, h := range allHops {
+		tooClose := false
+		for _, existing := range endCandidates {
+			diff := h.hop - existing
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < winHops {
+				tooClose = true
+				break
+			}
+		}
+		if !tooClose {
+			endCandidates = append(endCandidates, h.hop)
+		}
+		if len(endCandidates) == numEndCandidates {
+			break
+		}
+	}
+	// Fall back to evenly spaced positions if the range is too flat to yield minima.
+	if len(endCandidates) < 3 {
+		endCandidates = endCandidates[:0]
+		for ei := 0; ei < numEndCandidates; ei++ {
+			fraction := 0.80 + float64(ei)/float64(numEndCandidates-1)*0.18
+			endCandidates = append(endCandidates, int(fraction*float64(numHops)))
+		}
+	}
+
 	bestScore := -math.MaxFloat64
 	bestStartSample := 0
 	bestEndSample := n
 	bestCorr := 0.0
 
-	totalIter := numEndCandidates * numHops
+	totalIter := len(endCandidates) * numHops
 	progressStep := totalIter / 20
 	if progressStep < 1 {
 		progressStep = 1
 	}
 	progressCount := 0
 
-	for ei := 0; ei < numEndCandidates; ei++ {
-		fraction := 0.80 + float64(ei)/float64(numEndCandidates-1)*0.18
-		endHop := int(fraction * float64(numHops))
+	for _, endHop := range endCandidates {
 		if endHop+winHops > numHops {
 			endHop = numHops - winHops
 		}
@@ -669,4 +757,457 @@ func encodeMP3(path string, stats *AudioStats) error {
 	}
 
 	return nil
+}
+
+// ── Analysis mode ────────────────────────────────────────────────────────────
+
+// TrackAnalysis holds computed audio metrics for loop/focus suitability.
+type TrackAnalysis struct {
+	Path           string
+	Filename       string
+	Duration       time.Duration
+	BPM            float64 // estimated tempo
+	EnergyCV       float64 // coefficient of variation of RMS envelope; lower = more consistent
+	DynamicRangedB float64 // loudness spread between 5th and 95th energy percentiles (dB)
+	ZCR            float64 // mean zero-crossing rate; lower = warmer tone
+	LoopCorr       float64 // best loop-boundary correlation from detectLoop
+	LoopLengthPct  float64 // loop body as fraction [0,1] of total duration
+	FocusScore     float64 // composite 0–10
+}
+
+// runAnalyzeSingle analyzes one MP3 file and prints a markdown summary to stdout.
+func runAnalyzeSingle(path string) int {
+	if err := validateInput(path); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "Analyzing %s...\n", filepath.Base(path))
+	a, err := analyzeFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	printSingleAnalysisMarkdown(a)
+	return 0
+}
+
+// runAnalyzeBatch analyzes all MP3s in a directory, sorts by focus score, and
+// prints a ranked markdown table to stdout. Progress goes to stderr so the
+// output can be redirected to a .md file.
+func runAnalyzeBatch(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading directory %s: %v\n", dir, err)
+		return 1
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".mp3") {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
+	}
+	if len(files) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: no .mp3 files found in %s\n", dir)
+		return 1
+	}
+
+	results := make([]*TrackAnalysis, 0, len(files))
+	for i, f := range files {
+		fmt.Fprintf(os.Stderr, "[%d/%d] %s\n", i+1, len(files), filepath.Base(f))
+		a, err := analyzeFile(f)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  skipped: %v\n", err)
+			continue
+		}
+		results = append(results, a)
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].FocusScore > results[j].FocusScore
+	})
+
+	printBatchAnalysisMarkdown(results)
+	return 0
+}
+
+// analyzeFile decodes an MP3 and computes all focus/loop metrics.
+func analyzeFile(path string) (*TrackAnalysis, error) {
+	stats, err := decodeMP3(path)
+	if err != nil {
+		return nil, err
+	}
+	mono := pcmToMono(stats.PCM, stats.SampleRate, 11025)
+
+	// 500ms envelope for consistency, dynamic range, and reuse by detectLoop.
+	hopSamples := mono.SampleRate / 2
+	numHops := len(mono.Samples) / hopSamples
+	env := make([]float64, numHops)
+	for i := range env {
+		start := i * hopSamples
+		end := start + hopSamples
+		if end > len(mono.Samples) {
+			end = len(mono.Samples)
+		}
+		sum := 0.0
+		for _, s := range mono.Samples[start:end] {
+			sum += s * s
+		}
+		env[i] = math.Sqrt(sum / float64(end-start))
+	}
+
+	bpm := estimateBPM(mono)
+	cv := computeEnergyCV(env)
+	dr := computeDynamicRangeDB(env)
+	zcr := computeAvgZCR(mono.Samples, mono.SampleRate)
+
+	loop := detectLoop(mono, 10.0, 0)
+	loopLengthPct := 0.0
+	if s := stats.Duration.Seconds(); s > 0 {
+		loopLengthPct = loop.Length.Seconds() / s
+		if loopLengthPct > 1.0 {
+			loopLengthPct = 1.0
+		}
+	}
+
+	a := &TrackAnalysis{
+		Path:           path,
+		Filename:       filepath.Base(path),
+		Duration:       stats.Duration,
+		BPM:            bpm,
+		EnergyCV:       cv,
+		DynamicRangedB: dr,
+		ZCR:            zcr,
+		LoopCorr:       loop.Correlation,
+		LoopLengthPct:  loopLengthPct,
+	}
+	a.FocusScore = computeFocusScore(a)
+	return a, nil
+}
+
+// estimateBPM estimates tempo in BPM via onset-strength autocorrelation at 50ms hops.
+// The result is a rough estimate — may be off by a factor of 2 on complex rhythms.
+func estimateBPM(mono *MonoSignal) float64 {
+	const hopSec = 0.05 // 50ms — fine enough to resolve 50–220 BPM
+	hopSamples := int(hopSec * float64(mono.SampleRate))
+	if hopSamples < 1 {
+		hopSamples = 1
+	}
+	n := len(mono.Samples)
+	numHops := n / hopSamples
+	if numHops < 10 {
+		return 0
+	}
+
+	// RMS energy per 50ms hop.
+	energy := make([]float64, numHops)
+	for i := range energy {
+		start := i * hopSamples
+		end := start + hopSamples
+		if end > n {
+			end = n
+		}
+		sum := 0.0
+		for _, s := range mono.Samples[start:end] {
+			sum += s * s
+		}
+		energy[i] = math.Sqrt(sum / float64(end-start))
+	}
+
+	// Onset strength: positive energy increases frame-to-frame.
+	onset := make([]float64, numHops)
+	for i := 1; i < numHops; i++ {
+		if d := energy[i] - energy[i-1]; d > 0 {
+			onset[i] = d
+		}
+	}
+
+	// Autocorrelation over the 50–220 BPM lag range.
+	minLag := int(math.Round(60.0 / 220.0 / hopSec)) // ~220 BPM
+	maxLag := int(math.Round(60.0 / 50.0 / hopSec))  //  ~50 BPM
+	if minLag < 1 {
+		minLag = 1
+	}
+	if maxLag >= numHops {
+		maxLag = numHops - 1
+	}
+
+	bestLag, bestVal := minLag, -1.0
+	for lag := minLag; lag <= maxLag; lag++ {
+		sum := 0.0
+		for i := 0; i+lag < numHops; i++ {
+			sum += onset[i] * onset[i+lag]
+		}
+		if sum > bestVal {
+			bestVal = sum
+			bestLag = lag
+		}
+	}
+	return 60.0 / (float64(bestLag) * hopSec)
+}
+
+// computeEnergyCV returns the coefficient of variation (std/mean) of the envelope.
+// Lower means more consistent dynamics.
+func computeEnergyCV(envelope []float64) float64 {
+	n := float64(len(envelope))
+	if n == 0 {
+		return 0
+	}
+	mean := 0.0
+	for _, v := range envelope {
+		mean += v
+	}
+	mean /= n
+	if mean == 0 {
+		return 0
+	}
+	variance := 0.0
+	for _, v := range envelope {
+		d := v - mean
+		variance += d * d
+	}
+	return math.Sqrt(variance/n) / mean
+}
+
+// computeDynamicRangeDB returns the loudness spread (dB) between the 5th and 95th
+// energy percentiles — a measure of how much the volume swings.
+func computeDynamicRangeDB(envelope []float64) float64 {
+	if len(envelope) < 20 {
+		return 0
+	}
+	sorted := make([]float64, len(envelope))
+	copy(sorted, envelope)
+	sort.Float64s(sorted)
+	p5 := sorted[len(sorted)*5/100]
+	p95 := sorted[len(sorted)*95/100]
+	if p5 <= 0 {
+		return 60.0 // silence floor — treat as very wide range
+	}
+	if db := 20 * math.Log10(p95/p5); db > 0 {
+		return db
+	}
+	return 0
+}
+
+// computeAvgZCR returns the mean zero-crossing rate across 100ms windows.
+// Lower values indicate a warmer, bass-heavy tone; higher values indicate brightness.
+func computeAvgZCR(samples []float64, sampleRate int) float64 {
+	winSize := sampleRate / 10 // 100ms
+	if winSize < 2 || len(samples) < winSize {
+		return 0
+	}
+	numWins := len(samples) / winSize
+	total := 0.0
+	for w := 0; w < numWins; w++ {
+		seg := samples[w*winSize : w*winSize+winSize]
+		crossings := 0
+		for i := 1; i < len(seg); i++ {
+			if (seg[i] >= 0) != (seg[i-1] >= 0) {
+				crossings++
+			}
+		}
+		total += float64(crossings) / float64(len(seg)-1)
+	}
+	return total / float64(numWins)
+}
+
+// computeFocusScore returns a 0–10 composite score for concentration loop suitability.
+// Weights reflect research on focus-friendly audio: stable dynamics, moderate BPM,
+// warm tone, and a clean long loop are the strongest predictors.
+func computeFocusScore(a *TrackAnalysis) float64 {
+	// BPM: Gaussian peak at 75 BPM (lo-fi/ambient sweet spot), σ=30.
+	bpmScore := 0.0
+	if a.BPM > 0 {
+		bpmScore = math.Exp(-math.Pow((a.BPM-75)/30, 2))
+	}
+	// Energy consistency: CV=0 → 1.0, CV≥0.8 → 0.
+	consistencyScore := math.Max(0, 1.0-a.EnergyCV/0.8)
+	// Dynamic range: 0 dB → 1.0, 30+ dB → 0.
+	dynamicScore := math.Max(0, 1.0-a.DynamicRangedB/30.0)
+	// Spectral warmth: Gaussian peak at ZCR=0.08, σ=0.06.
+	warmthScore := math.Exp(-math.Pow((a.ZCR-0.08)/0.06, 2))
+	// Loop quality: correlation at the boundary.
+	loopScore := math.Max(0, a.LoopCorr)
+	// Loop coverage: how much of the track is in the loop body.
+	lengthScore := a.LoopLengthPct
+
+	// Weighted sum — total weights = 10, so result is naturally 0–10.
+	return math.Min(10, math.Max(0,
+		bpmScore*2.0+
+			consistencyScore*2.0+
+			dynamicScore*1.5+
+			warmthScore*1.0+
+			loopScore*2.0+
+			lengthScore*1.5,
+	))
+}
+
+// ── Formatting helpers ────────────────────────────────────────────────────────
+
+func verdictString(score float64) string {
+	switch {
+	case score >= 7.5:
+		return "✓✓ Great"
+	case score >= 5.5:
+		return "✓ Good"
+	case score >= 3.5:
+		return "~ Weak"
+	default:
+		return "✗ Skip"
+	}
+}
+
+func fmtDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+func cvLabel(cv float64) string {
+	switch {
+	case cv < 0.25:
+		return "high"
+	case cv < 0.50:
+		return "moderate"
+	default:
+		return "low"
+	}
+}
+
+func drLabel(db float64) string {
+	switch {
+	case db < 10:
+		return "low"
+	case db < 20:
+		return "moderate"
+	default:
+		return "high"
+	}
+}
+
+func warmthLabel(zcr float64) string {
+	switch {
+	case zcr < 0.07:
+		return "warm"
+	case zcr < 0.15:
+		return "moderate"
+	default:
+		return "bright"
+	}
+}
+
+func bpmNote(bpm float64) string {
+	switch {
+	case bpm <= 0:
+		return "could not estimate"
+	case bpm < 55:
+		return "very slow — ambient/drone territory"
+	case bpm < 90:
+		return "ideal range for focus"
+	case bpm < 120:
+		return "moderate — may still work"
+	default:
+		return "fast — energising rather than calming"
+	}
+}
+
+func printSingleAnalysisMarkdown(a *TrackAnalysis) {
+	fmt.Printf("## Analysis: %s\n\n", a.Filename)
+	fmt.Printf("| Metric | Value | Note |\n")
+	fmt.Printf("|--------|-------|------|\n")
+	fmt.Printf("| Duration | %s | — |\n", fmtDuration(a.Duration))
+	fmt.Printf("| BPM | %.0f | %s |\n", a.BPM, bpmNote(a.BPM))
+	fmt.Printf("| Energy consistency | %s (CV %.2f) | %s |\n",
+		cvLabel(a.EnergyCV), a.EnergyCV, consistencyNote(a.EnergyCV))
+	fmt.Printf("| Dynamic range | %.1f dB (%s) | %s |\n",
+		a.DynamicRangedB, drLabel(a.DynamicRangedB), drNote(a.DynamicRangedB))
+	fmt.Printf("| Spectral warmth | %s (ZCR %.3f) | %s |\n",
+		warmthLabel(a.ZCR), a.ZCR, warmthNote(a.ZCR))
+	fmt.Printf("| Loop correlation | %.2f | %s |\n", a.LoopCorr, loopCorrNote(a.LoopCorr))
+	fmt.Printf("| Loop body length | %.0f%% | %s |\n",
+		a.LoopLengthPct*100, loopLenNote(a.LoopLengthPct))
+	fmt.Printf("\n**Focus score: %.1f / 10 — %s**\n", a.FocusScore, verdictString(a.FocusScore))
+}
+
+func consistencyNote(cv float64) string {
+	if cv < 0.25 {
+		return "stable dynamics — great for background"
+	}
+	if cv < 0.50 {
+		return "some variation — acceptable"
+	}
+	return "high variation — potentially distracting"
+}
+
+func drNote(db float64) string {
+	if db < 10 {
+		return "narrow range — consistent loudness"
+	}
+	if db < 20 {
+		return "moderate range"
+	}
+	return "wide range — loud/quiet swings may distract"
+}
+
+func warmthNote(zcr float64) string {
+	if zcr < 0.07 {
+		return "warm tone — easy on ears over long sessions"
+	}
+	if zcr < 0.15 {
+		return "balanced tone"
+	}
+	return "bright/harsh — may cause fatigue over time"
+}
+
+func loopCorrNote(c float64) string {
+	if c >= 0.7 {
+		return "clean loop boundary"
+	}
+	if c >= 0.4 {
+		return "acceptable loop boundary"
+	}
+	return "rough boundary — audible transition likely"
+}
+
+func loopLenNote(pct float64) string {
+	if pct >= 0.80 {
+		return "most of the track loops — excellent"
+	}
+	if pct >= 0.50 {
+		return "majority of track covered"
+	}
+	return "short loop body — more repetition per cycle"
+}
+
+func printBatchAnalysisMarkdown(results []*TrackAnalysis) {
+	fmt.Printf("# Focus Loop Analysis\n\n")
+	fmt.Printf("Analyzed **%d tracks** · sorted by focus score (highest first)\n\n", len(results))
+	fmt.Println("| # | Track | Duration | BPM | Consistency | Dyn Range | Warmth | Loop | Length | Score | Verdict |")
+	fmt.Println("|---|-------|----------|-----|-------------|-----------|--------|------|--------|-------|---------|")
+	for i, a := range results {
+		fmt.Printf("| %d | %s | %s | %.0f | %s | %s | %s | %.2f | %.0f%% | **%.1f** | %s |\n",
+			i+1,
+			a.Filename,
+			fmtDuration(a.Duration),
+			a.BPM,
+			cvLabel(a.EnergyCV),
+			drLabel(a.DynamicRangedB),
+			warmthLabel(a.ZCR),
+			a.LoopCorr,
+			a.LoopLengthPct*100,
+			a.FocusScore,
+			verdictString(a.FocusScore),
+		)
+	}
+	fmt.Println()
+	fmt.Println("---")
+	fmt.Println()
+	fmt.Println("**Score legend:** ✓✓ Great (≥ 7.5) · ✓ Good (≥ 5.5) · ~ Weak (≥ 3.5) · ✗ Skip (< 3.5)")
+	fmt.Println()
+	fmt.Println("> BPM is estimated from onset-strength autocorrelation and may be off by a factor of 2 on some tracks.")
+	fmt.Println("> Redirect stdout to save: `music-loop --analyze ./music/ > analysis.md`")
 }

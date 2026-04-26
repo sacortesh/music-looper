@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./loop.sh <input.mp3|dir> <target-minutes> [options]
+#   ./loop.sh --analyze <input.mp3|dir>
 #
 # Options:
 #   -o, --output <path>       output file or directory (default: <input>_loop.mp3)
@@ -12,6 +13,7 @@
 #   -f, --fade-out <ms>       fade-out duration in milliseconds at end (default: 2000, 0 to disable)
 #   -d, --dry-run             analyze only, do not write output
 #   -v, --verbose             print detailed progress
+#   -a, --analyze             score track(s) for focus/loop suitability, output as markdown
 #
 # Examples:
 #   ./loop.sh song.mp3 30
@@ -21,6 +23,8 @@
 #   ./loop.sh song.mp3 10 --dry-run
 #   ./loop.sh ./tracks/ 30
 #   ./loop.sh ./tracks/ 30 --output ./looped/
+#   ./loop.sh --analyze song.mp3
+#   ./loop.sh --analyze ./tracks/ > analysis.md
 
 set -euo pipefail
 
@@ -32,8 +36,10 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-if [ $# -lt 2 ]; then
-    echo "Usage: ./loop.sh <input.mp3|dir> <target-minutes> [options]"
+usage() {
+    echo "Usage:"
+    echo "  ./loop.sh <input.mp3|dir> <target-minutes> [options]"
+    echo "  ./loop.sh --analyze <input.mp3|dir>"
     echo ""
     echo "Options:"
     echo "  -o, --output <path>     output file or directory (default: <input>_loop.mp3)"
@@ -43,6 +49,25 @@ if [ $# -lt 2 ]; then
     echo "  -f, --fade-out <ms>     fade-out at end in milliseconds (default: 2000, 0 to disable)"
     echo "  -d, --dry-run           analyze only, no output written"
     echo "  -v, --verbose           detailed progress output"
+    echo "  -a, --analyze           score track(s) for focus suitability, output as markdown"
+}
+
+if [ $# -lt 1 ]; then
+    usage
+    exit 1
+fi
+
+# Analyze mode: no target-minutes required
+if [ "$1" = "-a" ] || [ "$1" = "--analyze" ]; then
+    if [ $# -lt 2 ]; then
+        echo "Error: --analyze requires an input file or directory" >&2
+        exit 1
+    fi
+    exec "$BINARY" --analyze "$2"
+fi
+
+if [ $# -lt 2 ]; then
+    usage
     exit 1
 fi
 
@@ -61,6 +86,7 @@ while [ $# -gt 0 ]; do
         -f|--fade-out)  ARGS+=("--fade-out=$2");  shift 2 ;;
         -d|--dry-run)   ARGS+=("--dry-run");      shift   ;;
         -v|--verbose)   ARGS+=("--verbose");      shift   ;;
+        -a|--analyze)   ARGS+=("--analyze");      shift   ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
