@@ -4,7 +4,7 @@
 [x] MP3 decode (go-mp3) and encode (go-lame/CGO)
 [x] Mono conversion + 4× downsampling (44100→11025 Hz)
 [x] CLI flag parsing (all 7 flags + usage)
-[ ] FFT dependency (go-dsp not in go.mod; BPM/FFT analysis is heuristic-only)
+[x] FFT dependency (go-dsp not in go.mod; BPM/FFT analysis is heuristic-only)
 
 
 

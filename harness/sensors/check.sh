@@ -22,6 +22,9 @@ run_check() {
 }
 echo "Running sensors..."
 # ── Add checks below ──────────────────────────────────────────────────────────
+run_check "seamDisguise or applySeam func defined" bash -c "grep -qE 'func (seamDisguise|applySeam|layerTransient|ongOng)' main.go"
+run_check "loop point transient write in source" bash -c "grep -qE '(loopPoint|seamTransient|ongOng|toneTransient)' main.go"
+run_check "transient layered at sample boundary" bash -c "grep -qE '(loopStart|loopEnd|loopPoint)[^=]*[+]' main.go"
 run_check "go-dsp in go.mod" bash -c "grep -q 'go-dsp' go.mod"
 run_check "fft import in source" bash -c "grep -rq 'go-dsp/fft' --include='*.go' ."
 run_check "nextPow2 function defined" bash -c "grep -q 'func nextPow2' main.go"
