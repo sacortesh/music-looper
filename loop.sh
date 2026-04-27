@@ -14,6 +14,7 @@
 #   -d, --dry-run             analyze only, do not write output
 #   -v, --verbose             print detailed progress
 #   -a, --analyze             score track(s) for focus/loop suitability, output as markdown
+#   --seam-disguise <mode>    inject a transient at loop boundaries: "ong" (PS1-style) or "tone" (sine burst)
 #
 # Examples:
 #   ./loop.sh song.mp3 30
@@ -50,6 +51,7 @@ usage() {
     echo "  -d, --dry-run           analyze only, no output written"
     echo "  -v, --verbose           detailed progress output"
     echo "  -a, --analyze           score track(s) for focus suitability, output as markdown"
+    echo "  --seam-disguise <mode>  inject transient at loop boundaries: ong or tone"
 }
 
 if [ $# -lt 1 ]; then
@@ -87,6 +89,7 @@ while [ $# -gt 0 ]; do
         -d|--dry-run)   ARGS+=("--dry-run");      shift   ;;
         -v|--verbose)   ARGS+=("--verbose");      shift   ;;
         -a|--analyze)   ARGS+=("--analyze");      shift   ;;
+        --seam-disguise) ARGS+=("--seam-disguise=$2"); shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done

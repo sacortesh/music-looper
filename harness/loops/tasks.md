@@ -14,7 +14,7 @@
 [x] Audio extension to target duration
 [x] Crossfade blending at loop junctions (default 50ms)
 [x] Fade-out at end (default 2000ms)
-[ ] Seam disguise: tone patch or PS1-style "ong ong" transient layered at loop point
+[x] Seam disguise: tone patch or PS1-style "ong ong" transient layered at loop point
 
 
 

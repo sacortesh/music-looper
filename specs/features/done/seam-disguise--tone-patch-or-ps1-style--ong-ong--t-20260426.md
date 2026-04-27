@@ -37,3 +37,7 @@ Feature: Seam disguise at loop point
 ## Notes
 
 <!-- Human notes appended here during execute-task.sh iterations -->
+
+## Rejection Notes — 2026-04-26
+
+- recommendation: **return to loop** — dry-run path must compute and print the projected loop-boundary timestamps (not just loop.End/loop.Length) before returning; add a test asserting those timestamps appear in stdout and no output file is created. Also manual validation left no audible transition audio in the seam

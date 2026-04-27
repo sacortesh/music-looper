@@ -9,6 +9,8 @@ ralph.sh
 *.out
 *.prof
 vendor/
+__debug_bin*
+go.work.sum
 
 # Environment and editor noise
 .env

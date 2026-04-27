@@ -253,15 +253,29 @@ func processFile(inputPath, outputPath string, targetMinutes float64, opts loopO
 	fmt.Printf("Loop length:  %s\n", loop.Length.Round(time.Millisecond))
 	fmt.Printf("Correlation:  %.4f\n", loop.Correlation)
 
+	targetDur := time.Duration(targetMinutes * float64(time.Minute))
+
 	if opts.dryRun {
 		if opts.seamDisguise != "" {
 			fmt.Printf("Seam disguise: %s\n", opts.seamDisguise)
 		}
+		// Compute projected loop-boundary timestamps so callers can verify placement.
+		crossfadeDur := time.Duration(opts.crossfade) * time.Millisecond
+		loopStepDur := loop.Length - crossfadeDur
+		if loopStepDur <= 0 {
+			loopStepDur = loop.Length
+		}
+		seamDur := loop.End - crossfadeDur
+		if seamDur < 0 {
+			seamDur = 0
+		}
+		for seamDur < targetDur {
+			fmt.Printf("Loop seam: %s\n", seamDur.Round(time.Millisecond))
+			seamDur += loopStepDur
+		}
 		fmt.Println("Dry run — skipping output.")
 		return nil
 	}
-
-	targetDur := time.Duration(targetMinutes * float64(time.Minute))
 	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "[verbose] Extending audio to %s with %dms crossfade...\n", targetDur.Round(time.Millisecond), opts.crossfade)
 	}
@@ -274,15 +288,26 @@ func processFile(inputPath, outputPath string, targetMinutes float64, opts loopO
 		crossfadeFrames := opts.crossfade * stats.SampleRate / 1000
 		loopEnd := int(loop.End.Seconds() * float64(stats.SampleRate))
 		loopLen := int(loop.Length.Seconds() * float64(stats.SampleRate))
+		loopStep := loopLen - crossfadeFrames
+		if loopStep <= 0 {
+			loopStep = loopLen
+		}
 		var loopBoundaries []int
-		loopPoint := loopEnd
+		// The crossfade blend starts crossfadeFrames before loopEnd, so the
+		// actual seam (transition point) in the extended PCM is there.
+		loopPoint := loopEnd - crossfadeFrames
+		if loopPoint < 0 {
+			loopPoint = 0
+		}
 		for loopPoint < len(extendedPCM)/4 {
 			loopBoundaries = append(loopBoundaries, loopPoint)
-			loopPoint = loopPoint + loopLen - crossfadeFrames
+			loopPoint += loopStep
 		}
 		applySeamDisguise(extendedPCM, stats.SampleRate, opts.seamDisguise, loopBoundaries)
-		if opts.verbose {
-			fmt.Fprintf(os.Stderr, "[verbose] Seam disguise (%s) applied at %d boundary point(s).\n", opts.seamDisguise, len(loopBoundaries))
+		fmt.Printf("Seam disguise: %s at %d point(s)\n", opts.seamDisguise, len(loopBoundaries))
+		for i, lp := range loopBoundaries {
+			ts := time.Duration(float64(lp) / float64(stats.SampleRate) * float64(time.Second))
+			fmt.Printf("  seam[%d]: %s\n", i+1, ts.Round(time.Millisecond))
 		}
 	}
 
@@ -790,28 +815,42 @@ func encodeMP3(path string, stats *AudioStats) error {
 
 // ── Seam disguise ────────────────────────────────────────────────────────────
 
-// generateOngTransient synthesises a PS1-style disc-reload click (≤ 200ms).
-// The sound is a low-frequency thump (60 Hz sine) with an exponential decay
-// envelope, intended to mask the loop seam with a familiar game-console cue.
+// generateOngTransient returns the PS1-style double disc-reload click:
+// heavy body (~449ms) + 300ms silence + short click (~155ms).
+// PCM is sourced from a real PS1 recording embedded in ong_transient_pcm.go.
+// If the track sample rate differs from the recording, nearest-neighbour
+// resampling is applied so timing stays consistent.
 func generateOngTransient(sampleRate int) []byte {
-	const durationMs = 150 // ≤ 200ms
-	numFrames := durationMs * sampleRate / 1000
-	bytesPerFrame := 4 // stereo 16-bit
-	buf := make([]byte, numFrames*bytesPerFrame)
+	heavy := resamplePCM(ongTransientPart2PCM, ongTransientSampleRate, sampleRate)
+	click := resamplePCM(ongTransientPart1PCM, ongTransientSampleRate, sampleRate)
+	gapFrames := 300 * sampleRate / 1000
+	gap := make([]byte, gapFrames*4)
+	out := make([]byte, 0, len(heavy)+len(gap)+len(click))
+	out = append(out, heavy...)
+	out = append(out, gap...)
+	out = append(out, click...)
+	return out
+}
 
-	const freq = 60.0  // Hz — sub-bass thump
-	const peakAmp = 0.45 // ~-6.9 dBFS, clearly audible without overpowering
-	decayRate := math.Log(0.01) / float64(numFrames) // reaches 1% at end
-
-	for i := 0; i < numFrames; i++ {
-		phase := 2 * math.Pi * freq * float64(i) / float64(sampleRate)
-		env := math.Exp(decayRate * float64(i))
-		s := int16(peakAmp * env * math.Sin(phase) * 32767)
-		off := i * bytesPerFrame
-		binary.LittleEndian.PutUint16(buf[off:], uint16(s))
-		binary.LittleEndian.PutUint16(buf[off+2:], uint16(s))
+// resamplePCM resamples stereo 16-bit PCM from srcRate to dstRate
+// using nearest-neighbour — accurate enough for short transients.
+func resamplePCM(pcm []byte, srcRate, dstRate int) []byte {
+	if srcRate == dstRate {
+		out := make([]byte, len(pcm))
+		copy(out, pcm)
+		return out
 	}
-	return buf
+	srcFrames := len(pcm) / 4
+	dstFrames := srcFrames * dstRate / srcRate
+	out := make([]byte, dstFrames*4)
+	for i := 0; i < dstFrames; i++ {
+		srcIdx := i * srcRate / dstRate
+		if srcIdx >= srcFrames {
+			srcIdx = srcFrames - 1
+		}
+		copy(out[i*4:i*4+4], pcm[srcIdx*4:srcIdx*4+4])
+	}
+	return out
 }
 
 // generateToneTransient synthesises a brief sine-wave burst (≤ 100ms) at -12 dBFS

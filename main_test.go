@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -496,8 +499,11 @@ func TestGenerateOngTransient_Duration(t *testing.T) {
 	buf := generateOngTransient(sr)
 	numFrames := len(buf) / 4
 	durationMs := numFrames * 1000 / sr
-	if durationMs > 200 {
-		t.Errorf("ong transient duration %dms exceeds 200ms limit", durationMs)
+	// The ong transient is a double-tap (part1 + gap + part2) from a real PS1
+	// recording; the user explicitly waived the original 200ms limit.
+	// Guard against runaway growth: must be ≤ 2000ms.
+	if durationMs > 2000 {
+		t.Errorf("ong transient duration %dms exceeds 2000ms sanity limit", durationMs)
 	}
 	if len(buf) == 0 {
 		t.Error("ong transient is empty")
@@ -674,5 +680,50 @@ func TestSeamDisguise_InvalidFlagReturnsError(t *testing.T) {
 	code := run([]string{"--seam-disguise", "invalid", input, "1"})
 	if code == 0 {
 		t.Fatal("expected non-zero exit code for invalid --seam-disguise value")
+	}
+}
+
+func TestDryRunSeamDisguise_PrintsBoundariesNoFile(t *testing.T) {
+	const input = "sample1.mp3"
+	if _, err := os.Stat(input); os.IsNotExist(err) {
+		t.Skip("sample1.mp3 not found")
+	}
+
+	// Capture stdout via a pipe so we can assert on its contents.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+
+	code := run([]string{"--dry-run", "--seam-disguise", "ong", input, "20"})
+
+	w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r) //nolint:errcheck
+	output := buf.String()
+
+	if code != 0 {
+		t.Fatalf("run() returned %d, want 0\nstdout: %s", code, output)
+	}
+
+	// Seam disguise type must appear.
+	if !strings.Contains(output, "Seam disguise: ong") {
+		t.Errorf("stdout missing seam disguise type; got:\n%s", output)
+	}
+
+	// At least one projected boundary timestamp must appear.
+	if !strings.Contains(output, "Loop seam:") {
+		t.Errorf("stdout missing loop seam timestamps; got:\n%s", output)
+	}
+
+	// No output file must have been written.
+	outPath := defaultOutputPath(input)
+	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
+		os.Remove(outPath)
+		t.Error("output file must not be created in dry-run mode")
 	}
 }
