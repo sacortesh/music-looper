@@ -23,12 +23,13 @@ func main() {
 
 // loopOptions holds all processing parameters shared between single and batch modes.
 type loopOptions struct {
-	minLoop   float64
-	maxLoop   float64
-	crossfade int
-	fadeOut   int
-	dryRun    bool
-	verbose   bool
+	minLoop      float64
+	maxLoop      float64
+	crossfade    int
+	fadeOut      int
+	dryRun       bool
+	verbose      bool
+	seamDisguise string // "ong" | "tone" | "" (disabled)
 }
 
 // run contains the main logic, returning an exit code. This makes testing easier.
@@ -42,6 +43,7 @@ func run(args []string) int {
 	dryRun := fs.Bool("dry-run", false, "analyze only, do not write output file")
 	verbose := fs.Bool("verbose", false, "print detailed progress information")
 	analyze := fs.Bool("analyze", false, "score track(s) for concentration/focus loop suitability and output a markdown table")
+	seamDisguiseFlag := fs.String("seam-disguise", "", "inject a transient at each loop boundary to mask the seam: \"ong\" (PS1-style click, ≤200ms) or \"tone\" (sine burst, ≤100ms)")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
@@ -86,6 +88,11 @@ func run(args []string) int {
 		return 1
 	}
 
+	if *seamDisguiseFlag != "" && *seamDisguiseFlag != "ong" && *seamDisguiseFlag != "tone" {
+		fmt.Fprintf(os.Stderr, "Error: --seam-disguise must be \"ong\" or \"tone\"\n")
+		return 1
+	}
+
 	if *minLoop < 0 {
 		fmt.Fprintf(os.Stderr, "Error: --min-loop must be non-negative\n")
 		return 1
@@ -100,12 +107,13 @@ func run(args []string) int {
 	}
 
 	opts := loopOptions{
-		minLoop:   *minLoop,
-		maxLoop:   *maxLoop,
-		crossfade: *crossfade,
-		fadeOut:   *fadeOut,
-		dryRun:    *dryRun,
-		verbose:   *verbose,
+		minLoop:      *minLoop,
+		maxLoop:      *maxLoop,
+		crossfade:    *crossfade,
+		fadeOut:      *fadeOut,
+		dryRun:       *dryRun,
+		verbose:      *verbose,
+		seamDisguise: *seamDisguiseFlag,
 	}
 
 	// Batch mode: input is a directory
@@ -246,6 +254,9 @@ func processFile(inputPath, outputPath string, targetMinutes float64, opts loopO
 	fmt.Printf("Correlation:  %.4f\n", loop.Correlation)
 
 	if opts.dryRun {
+		if opts.seamDisguise != "" {
+			fmt.Printf("Seam disguise: %s\n", opts.seamDisguise)
+		}
 		fmt.Println("Dry run — skipping output.")
 		return nil
 	}
@@ -258,6 +269,23 @@ func processFile(inputPath, outputPath string, targetMinutes float64, opts loopO
 	if opts.verbose {
 		fmt.Fprintf(os.Stderr, "\r[progress] Extending audio... 100%%\n")
 	}
+
+	if opts.seamDisguise != "" {
+		crossfadeFrames := opts.crossfade * stats.SampleRate / 1000
+		loopEnd := int(loop.End.Seconds() * float64(stats.SampleRate))
+		loopLen := int(loop.Length.Seconds() * float64(stats.SampleRate))
+		var loopBoundaries []int
+		loopPoint := loopEnd
+		for loopPoint < len(extendedPCM)/4 {
+			loopBoundaries = append(loopBoundaries, loopPoint)
+			loopPoint = loopPoint + loopLen - crossfadeFrames
+		}
+		applySeamDisguise(extendedPCM, stats.SampleRate, opts.seamDisguise, loopBoundaries)
+		if opts.verbose {
+			fmt.Fprintf(os.Stderr, "[verbose] Seam disguise (%s) applied at %d boundary point(s).\n", opts.seamDisguise, len(loopBoundaries))
+		}
+	}
+
 	extendedDur := time.Duration(float64(len(extendedPCM)/4) / float64(stats.SampleRate) * float64(time.Second))
 	fmt.Printf("Extended:     %s\n", extendedDur.Round(time.Millisecond))
 
@@ -758,6 +786,129 @@ func encodeMP3(path string, stats *AudioStats) error {
 	}
 
 	return nil
+}
+
+// ── Seam disguise ────────────────────────────────────────────────────────────
+
+// generateOngTransient synthesises a PS1-style disc-reload click (≤ 200ms).
+// The sound is a low-frequency thump (60 Hz sine) with an exponential decay
+// envelope, intended to mask the loop seam with a familiar game-console cue.
+func generateOngTransient(sampleRate int) []byte {
+	const durationMs = 150 // ≤ 200ms
+	numFrames := durationMs * sampleRate / 1000
+	bytesPerFrame := 4 // stereo 16-bit
+	buf := make([]byte, numFrames*bytesPerFrame)
+
+	const freq = 60.0  // Hz — sub-bass thump
+	const peakAmp = 0.45 // ~-6.9 dBFS, clearly audible without overpowering
+	decayRate := math.Log(0.01) / float64(numFrames) // reaches 1% at end
+
+	for i := 0; i < numFrames; i++ {
+		phase := 2 * math.Pi * freq * float64(i) / float64(sampleRate)
+		env := math.Exp(decayRate * float64(i))
+		s := int16(peakAmp * env * math.Sin(phase) * 32767)
+		off := i * bytesPerFrame
+		binary.LittleEndian.PutUint16(buf[off:], uint16(s))
+		binary.LittleEndian.PutUint16(buf[off+2:], uint16(s))
+	}
+	return buf
+}
+
+// generateToneTransient synthesises a brief sine-wave burst (≤ 100ms) at -12 dBFS
+// relative to peakAmplitude. peakAmplitude is the normalised [0,1] peak of the track.
+func generateToneTransient(sampleRate int, peakAmplitude float64) []byte {
+	const durationMs = 80 // ≤ 100ms
+	const attackMs = 5
+	const releaseMs = 5
+	const freq = 880.0 // Hz — audible but not harsh
+
+	numFrames := durationMs * sampleRate / 1000
+	attackFrames := attackMs * sampleRate / 1000
+	releaseFrames := releaseMs * sampleRate / 1000
+	bytesPerFrame := 4
+
+	// Amplitude must be ≤ -12 dBFS relative to track peak.
+	const dbOffset = -12.0
+	toneAmp := peakAmplitude * math.Pow(10.0, dbOffset/20.0)
+	if toneAmp > 1.0 {
+		toneAmp = 1.0
+	}
+
+	buf := make([]byte, numFrames*bytesPerFrame)
+	for i := 0; i < numFrames; i++ {
+		// Trapezoidal amplitude envelope: attack → sustain → release
+		env := 1.0
+		if i < attackFrames && attackFrames > 0 {
+			env = float64(i) / float64(attackFrames)
+		} else if i >= numFrames-releaseFrames && releaseFrames > 0 {
+			env = float64(numFrames-i) / float64(releaseFrames)
+		}
+		phase := 2 * math.Pi * freq * float64(i) / float64(sampleRate)
+		s := int16(toneAmp * env * math.Sin(phase) * 32767)
+		off := i * bytesPerFrame
+		binary.LittleEndian.PutUint16(buf[off:], uint16(s))
+		binary.LittleEndian.PutUint16(buf[off+2:], uint16(s))
+	}
+	return buf
+}
+
+// layerTransient additively mixes transient PCM into dst starting at loopPoint (frame index).
+// Samples are clamped to int16 range to prevent clipping.
+func layerTransient(dst []byte, transient []byte, loopPoint int) {
+	bytesPerFrame := 4
+	transientFrames := len(transient) / bytesPerFrame
+	for i := 0; i < transientFrames; i++ {
+		dstFrame := loopPoint + i
+		if dstFrame*bytesPerFrame+bytesPerFrame > len(dst) {
+			break
+		}
+		tOff := i * bytesPerFrame
+		dOff := dstFrame * bytesPerFrame
+		for ch := 0; ch < 2; ch++ {
+			ti := tOff + ch*2
+			di := dOff + ch*2
+			tv := int32(int16(binary.LittleEndian.Uint16(transient[ti : ti+2])))
+			dv := int32(int16(binary.LittleEndian.Uint16(dst[di : di+2])))
+			mixed := tv + dv
+			if mixed > 32767 {
+				mixed = 32767
+			} else if mixed < -32768 {
+				mixed = -32768
+			}
+			binary.LittleEndian.PutUint16(dst[di:di+2], uint16(int16(mixed)))
+		}
+	}
+}
+
+// applySeamDisguise injects the requested transient at each loop boundary position.
+// kind must be "ong" or "tone"; loopBoundaries is a slice of frame indices in dst.
+func applySeamDisguise(dst []byte, sampleRate int, kind string, loopBoundaries []int) {
+	if len(loopBoundaries) == 0 {
+		return
+	}
+
+	// Compute normalised peak amplitude for -12 dBFS calculation.
+	peakAmplitude := 0.0
+	for i := 0; i+1 < len(dst); i += 2 {
+		v := math.Abs(float64(int16(binary.LittleEndian.Uint16(dst[i : i+2]))))
+		if v > peakAmplitude {
+			peakAmplitude = v
+		}
+	}
+	peakAmplitude /= 32768.0
+
+	var seamTransient []byte
+	switch kind {
+	case "ong":
+		seamTransient = generateOngTransient(sampleRate)
+	case "tone":
+		toneTransient := generateToneTransient(sampleRate, peakAmplitude)
+		seamTransient = toneTransient
+	}
+
+	for _, loopPoint := range loopBoundaries {
+		layerTransient(dst, seamTransient, loopPoint)
+	}
 }
 
 // ── Analysis mode ────────────────────────────────────────────────────────────

@@ -488,3 +488,191 @@ func TestVerboseFlag_DryRun(t *testing.T) {
 		t.Fatalf("run() returned exit code %d, expected 0", code)
 	}
 }
+
+// ── Seam disguise tests ───────────────────────────────────────────────────────
+
+func TestGenerateOngTransient_Duration(t *testing.T) {
+	sr := 44100
+	buf := generateOngTransient(sr)
+	numFrames := len(buf) / 4
+	durationMs := numFrames * 1000 / sr
+	if durationMs > 200 {
+		t.Errorf("ong transient duration %dms exceeds 200ms limit", durationMs)
+	}
+	if len(buf) == 0 {
+		t.Error("ong transient is empty")
+	}
+}
+
+func TestGenerateOngTransient_NonSilent(t *testing.T) {
+	buf := generateOngTransient(44100)
+	allZero := true
+	for _, b := range buf {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.Error("ong transient is silent (all zero)")
+	}
+}
+
+func TestGenerateToneTransient_Duration(t *testing.T) {
+	sr := 44100
+	buf := generateToneTransient(sr, 0.8)
+	numFrames := len(buf) / 4
+	durationMs := numFrames * 1000 / sr
+	if durationMs > 100 {
+		t.Errorf("tone transient duration %dms exceeds 100ms limit", durationMs)
+	}
+	if len(buf) == 0 {
+		t.Error("tone transient is empty")
+	}
+}
+
+func TestGenerateToneTransient_AmplitudeLimit(t *testing.T) {
+	sr := 44100
+	peakAmplitude := 1.0 // full scale
+	buf := generateToneTransient(sr, peakAmplitude)
+
+	// Find peak amplitude of the transient in normalised [0,1] terms.
+	maxVal := 0.0
+	for i := 0; i+1 < len(buf); i += 2 {
+		v := math.Abs(float64(int16(binary.LittleEndian.Uint16(buf[i : i+2])))) / 32768.0
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+
+	// Must be ≤ -12 dBFS relative to peakAmplitude=1.0 → ≤ 0.2512
+	const limit = 0.252 // 10^(-12/20) ≈ 0.2512, with a small tolerance
+	if maxVal > limit {
+		t.Errorf("tone transient peak %.4f exceeds -12dBFS limit (%.4f)", maxVal, limit)
+	}
+}
+
+func TestLayerTransient_MixesIntoBuffer(t *testing.T) {
+	// 100 frames of silence.
+	dst := make([]byte, 100*4)
+	// Transient: 10 frames, full-positive on both channels.
+	transient := make([]byte, 10*4)
+	for i := 0; i < 10; i++ {
+		binary.LittleEndian.PutUint16(transient[i*4:], uint16(int16(1000)))
+		binary.LittleEndian.PutUint16(transient[i*4+2:], uint16(int16(1000)))
+	}
+
+	loopPoint := 5
+	layerTransient(dst, transient, loopPoint)
+
+	// Frame at loopPoint should now be 1000.
+	got := int16(binary.LittleEndian.Uint16(dst[loopPoint*4 : loopPoint*4+2]))
+	if got != 1000 {
+		t.Errorf("expected 1000 at loopPoint frame, got %d", got)
+	}
+	// Frame before loopPoint should still be 0.
+	before := int16(binary.LittleEndian.Uint16(dst[(loopPoint-1)*4 : (loopPoint-1)*4+2]))
+	if before != 0 {
+		t.Errorf("expected 0 before loopPoint, got %d", before)
+	}
+}
+
+func TestLayerTransient_Clamps(t *testing.T) {
+	// dst at full positive, transient at full positive — result must not wrap.
+	dst := make([]byte, 10*4)
+	for i := 0; i < 10; i++ {
+		binary.LittleEndian.PutUint16(dst[i*4:], uint16(int16(32767)))
+		binary.LittleEndian.PutUint16(dst[i*4+2:], uint16(int16(32767)))
+	}
+	transient := make([]byte, 5*4)
+	for i := 0; i < 5; i++ {
+		binary.LittleEndian.PutUint16(transient[i*4:], uint16(int16(32767)))
+		binary.LittleEndian.PutUint16(transient[i*4+2:], uint16(int16(32767)))
+	}
+	layerTransient(dst, transient, 0)
+	for i := 0; i < 5; i++ {
+		v := int16(binary.LittleEndian.Uint16(dst[i*4 : i*4+2]))
+		if v != 32767 {
+			t.Errorf("frame %d: expected clamped 32767, got %d", i, v)
+		}
+	}
+}
+
+func TestApplySeamDisguise_OngModifiesBuffer(t *testing.T) {
+	sr := 44100
+	frames := sr * 5
+	pcm := make([]byte, frames*4)
+	// Fill with a mid-level signal so there's a measurable peak.
+	for i := 0; i < frames; i++ {
+		binary.LittleEndian.PutUint16(pcm[i*4:], uint16(int16(8000)))
+		binary.LittleEndian.PutUint16(pcm[i*4+2:], uint16(int16(8000)))
+	}
+	original := make([]byte, len(pcm))
+	copy(original, pcm)
+
+	boundaries := []int{sr, sr * 3}
+	applySeamDisguise(pcm, sr, "ong", boundaries)
+
+	// At least some samples near the boundary must differ from the original.
+	changed := false
+	for i := sr * 4; i < (sr+100)*4; i++ {
+		if pcm[i] != original[i] {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		t.Error("expected applySeamDisguise to modify samples near loop boundary")
+	}
+}
+
+func TestApplySeamDisguise_ToneModifiesBuffer(t *testing.T) {
+	sr := 44100
+	frames := sr * 5
+	pcm := make([]byte, frames*4)
+	for i := 0; i < frames; i++ {
+		binary.LittleEndian.PutUint16(pcm[i*4:], uint16(int16(8000)))
+		binary.LittleEndian.PutUint16(pcm[i*4+2:], uint16(int16(8000)))
+	}
+	original := make([]byte, len(pcm))
+	copy(original, pcm)
+
+	applySeamDisguise(pcm, sr, "tone", []int{sr})
+
+	changed := false
+	for i := sr * 4; i < (sr+100)*4; i++ {
+		if pcm[i] != original[i] {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		t.Error("expected tone seam disguise to modify samples near loop boundary")
+	}
+}
+
+func TestApplySeamDisguise_EmptyBoundaries(t *testing.T) {
+	sr := 44100
+	pcm := make([]byte, sr*4)
+	original := make([]byte, len(pcm))
+	copy(original, pcm)
+	// Should be a no-op with empty boundaries.
+	applySeamDisguise(pcm, sr, "ong", nil)
+	for i, b := range pcm {
+		if b != original[i] {
+			t.Error("expected no-op with empty boundaries")
+			break
+		}
+	}
+}
+
+func TestSeamDisguise_InvalidFlagReturnsError(t *testing.T) {
+	const input = "sample1.mp3"
+	if _, err := os.Stat(input); os.IsNotExist(err) {
+		t.Skip("sample1.mp3 not found")
+	}
+	code := run([]string{"--seam-disguise", "invalid", input, "1"})
+	if code == 0 {
+		t.Fatal("expected non-zero exit code for invalid --seam-disguise value")
+	}
+}
